@@ -16,6 +16,7 @@ dependencies:
 # from defaults channel
 - pandas
 - nb_conda_kernels
+- humanfriendly
 - jupyterlab
 - matplotlib
 - mypy
@@ -27,8 +28,8 @@ dependencies:
 - tqdm
 - scikit-learn
 - tensorboard
-- humanfriendly
 - pip
+- xlrd          # for pandas Excel support, needed by taxonomy_mapping/process_species_by_dataset
 
 # Some Azure packages or versions are only available from PyPI
 # These may require GCC to be installed
