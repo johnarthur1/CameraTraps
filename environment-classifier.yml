@@ -1,0 +1,38 @@
+name: cameratraps-classifier
+
+channels:
+- pytorch
+- defaults
+
+dependencies:
+- python>=3.6
+
+# from pytorch channel
+- pytorch
+- torchvision
+- cpuonly  # for CPU only
+# - cudatoolkit=10.2  # for GPU
+
+# from defaults channel
+- pandas
+- nb_conda_kernels
+- jupyterlab
+- matplotlib
+- mypy
+- pillow
+- pylint
+- numpy
+- openpyxl      # used by taxonomy_mapping/species_by_dataset.py
+- progressbar2  # used by ai4eutils (which is called by taxonomy-mapping code)
+- tqdm
+- scikit-learn
+- tensorboard
+- humanfriendly
+- pip
+
+# Some Azure packages or versions are only available from PyPI
+# These may require GCC to be installed
+- pip:
+  - azure-cosmos
+  # doc: https://azure-storage.readthedocs.io - this will go to versions prior to v12 update
+  - azure-storage-blob>=1.5.0, <=2.1.0   
