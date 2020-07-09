@@ -1,10 +1,98 @@
 """Validates the JSON file."""
+from __future__ import annotations
+
 import argparse
-from collections import defaultdict
 import json
-from typing import Any, Dict, Mapping, Set, Tuple
+from typing import Any, Container, Dict, List, Mapping, Optional, Set, Tuple
 
 import pandas as pd
+
+
+class TaxonNode:
+    r"""A node in a taxonomy tree, associated with a set of dataset labels.
+
+    By default we support multiple parents for each TaxonNode because different
+    taxonomies may have a different granularity of hierarchy. If the taxonomy
+    was created from a mixture of different taxonomies, then we may see the
+    following, for example:
+
+        "eastern gray squirrel" (inat)     "squirrel" (gbif)
+        ------------------------------     -----------------
+    family:                        sciuridae
+                                  /          \
+    subfamily:          sciurinae             |  # skips subfamily
+                                |             |
+    tribe:               sciurini             |  # skips tribe
+                                  \          /
+    genus:                          sciurus
+    """
+    # class variables
+    single_parent_only = False
+
+    def __init__(self, level: str, name: str):
+        """Initializes a TaxonNode."""
+        self.level = level
+        self.name = name
+        self.ids: Set[Tuple[str, int]] = set()
+        self.children: List[TaxonNode] = []
+        self.parents: List[TaxonNode] = []
+        self.dataset_labels: Set[Tuple[str, str]] = set()
+
+    def __repr__(self):
+        id_str = ', '.join(f'{source}={id}' for source, id in self.ids)
+        return f'TaxonNode({id_str}, level={self.level}, name={self.name})'
+
+    def add_id(self, source: str, taxon_id: int):
+        assert source in ['gbif', 'inat', 'manual']
+        self.ids.add((source, taxon_id))
+
+    def add_parent(self, parent: TaxonNode):
+        """Adds a TaxonNode to the list of parents of the current TaxonNode.
+
+        Args:
+            parent: TaxonNode, must be higher in the taxonomical hierarchy
+        """
+        if TaxonNode.single_parent_only and len(self.parents) > 0:
+            assert len(self.parents) == 1
+            assert self.parents[0] is parent, (
+                f'self.parents: {self.parents}, new parent: {parent}')
+            return
+        if parent not in self.parents:
+            self.parents.append(parent)
+            parent.add_child(self)
+
+    def add_child(self, child: TaxonNode):
+        if child not in self.children:
+            self.children.append(child)
+            child.add_parent(self)
+
+    def add_dataset_label(self, ds: str, ds_label: str) -> None:
+        """
+        Args:
+            ds: str, name of dataset
+            ds_label: str, name of label used by that dataset
+        """
+        self.dataset_labels.add((ds, ds_label))
+
+    def get_dataset_labels(self,
+                           include_datasets: Optional[Container[str]] = None
+                           ) -> Set[Tuple[str, str]]:
+        """Returns a set of all (ds, ds_label) tuples that belong to this taxon
+        node or its descendants.
+
+        Args:
+            include_datasets: list of str, names of datasets to include
+                if None, then all datasets are included
+
+        Returns: set of (ds, ds_label) tuples
+        """
+        result = self.dataset_labels
+        if include_datasets is not None:
+            result = set(tup for tup in result if tup[0] in include_datasets)
+
+        for child in self.children:
+            result |= child.get_dataset_labels()
+        return result
 
 
 def main():
@@ -13,8 +101,10 @@ def main():
     with open(args.input_json, 'r') as f:
         js = json.load(f)
     taxonomy_df = pd.read_csv(args.input_taxonomy_csv)
+    if args.single_parent_taxonomy:
+        TaxonNode.single_parent_only = True
     taxonomy_dict = build_taxonomy_dict(taxonomy_df)
-    validate_json(js, taxonomy_dict)
+    validate_json(js, taxonomy_dict, allow_multilabel=args.allow_multilabel)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -27,39 +117,102 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         'input_taxonomy_csv',
         help='path to taxonomy CSV file')
+    parser.add_argument(
+        '--allow-multilabel', action='store_true',
+        help='flag that allows assigning a (dataset, dataset_label) pair to '
+             'multiple output labels')
+    parser.add_argument(
+        '--single_parent_taxonomy', action='store_true',
+        help='flag that restricts the taxonomy to only allow a single parent '
+             'for each taxon node')
     return parser.parse_args()
 
 
-def build_taxonomy_dict(taxonomy_df: pd.DataFrame) -> Dict[str, Tuple[str, str]]:
-    for i, row in taxonomy_df.iterrows():
-        pass
+def build_taxonomy_dict(taxonomy_df: pd.DataFrame
+                        ) -> Dict[Tuple[str, str], TaxonNode]:
+    """Creates a mapping from (taxon_level, taxon_name) to TaxonNodes, used for
+    gathering all dataset labels associated with a given taxon.
 
+    Args:
+        taxonomy_df: pd.DataFrame, see taxonomy_mapping directory for more info
 
-def parse_taxa(taxa_dict: Mapping[str, str],
-               taxonomy_dict: Mapping[str, Mapping[str, Set[str]]]
-               ) -> Set[Tuple[str, str]]:
-    results = set()
-    for taxon in taxa_dict:
-        taxon_name = taxon['name']
-        taxon_level = taxon['level']
-        taxon_id = f'{taxon_name}/{taxon_level}'
-        datasets = taxon.get('datasets', None)
-        ds_to_labels = taxonomy_dict[taxon_id]
-        if datasets is None:
-            for ds, ds_labels in ds_to_labels.items():
-                results += {(ds, ds_label) for ds_label in ds_labels}
+    Returns: dict, maps (taxon_level, taxon_name) to a TaxonNode
+    """
+    taxonomy_dict = {}
+    for _, row in taxonomy_df.iterrows():
+        ds = row['dataset_name']
+        ds_label = row['query']
+        taxa_ancestry = row['taxonomy_string']
+        id_source = row['source']
+        if pd.isna(taxa_ancestry):
+            # taxonomy CSV rows without 'taxonomy_string' entries can only be
+            # added to the JSON via the 'dataset_labels' key
+            continue
         else:
-            for ds in datasets:
-                results += {(ds, ds_label) for ds_label in ds_to_labels[ds]}
+            taxa_ancestry = eval(taxa_ancestry)  # pylint: disable=eval-used
+
+        taxon_child = None
+        for i, taxon in enumerate(taxa_ancestry):
+            taxon_id, taxon_level, taxon_name, _ = taxon
+
+            key = (taxon_level, taxon_name)
+            if key not in taxonomy_dict:
+                node = TaxonNode(level=taxon_level, name=taxon_name)
+                if taxon_child is not None:
+                    node.add_child(taxon_child)
+                taxonomy_dict[key] = node
+
+            node = taxonomy_dict[key]
+            node.add_id(id_source, int(taxon_id))  # np.int64 -> int
+            if i == 0:
+                assert row['taxonomy_level'] == taxon_level, (
+                    f'taxonomy CSV level: {row["taxonomy_level"]}, '
+                    f'level from taxonomy_string: {taxon_level}')
+                assert row['scientific_name'] == taxon_name
+                node.add_dataset_label(ds, ds_label)
+
+            taxon_child = node
+
+    # returns a dict that maps (taxon_level, taxon_name) to a TaxonNode
+    return taxonomy_dict
+
+
+def parse_taxa(taxa_dicts: List[Dict[str, str]],
+               taxonomy_dict: Dict[Tuple[str, str], TaxonNode]
+               ) -> Set[Tuple[str, str]]:
+    """Gathers the dataset labels requested by a "taxa" specification.
+
+    Args:
+        taxa_dicts: list of dict, corresponds to the "taxa" key in JSON, e.g.,
+            [
+                {'level': 'family', 'name': 'cervidae', 'datasets': ['idfg']},
+                {'level': 'genus',  'name': 'meleagris'}
+            ]
+        taxonomy_dict: dict, maps (taxon_level, taxon_name) to a TaxonNode
+
+    Returns: set of (ds, ds_label), dataset labels requested by the taxa spec
+    """
+    results = set()
+    for taxon in taxa_dicts:
+        key = (taxon['level'], taxon['name'])
+        datasets = taxon.get('datasets', None)
+        results |= taxonomy_dict[key].get_dataset_labels(datasets)
     return results
 
 
 def parse_spec(spec_dict: Mapping[str, Any],
-               taxonomy_dict: Mapping[str, Set[Tuple[str, str]]]
+               taxonomy_dict: Dict[Tuple[str, str], TaxonNode]
                ) -> Set[Tuple[str, str]]:
+    """
+    Args:
+        spec_dict: dict, contains keys ['taxa', 'dataset_labels']
+        taxonomy_dict: dict, maps (taxon_level, taxon_name) to a TaxonNode
+
+    Returns: set of (ds, ds_label), dataset labels requested by the spec
+    """
     results = set()
     if 'taxa' in spec_dict:
-        results += parse_taxa(spec_dict['taxa'], taxonomy_dict)
+        results |= parse_taxa(spec_dict['taxa'], taxonomy_dict)
     if 'dataset_labels' in spec_dict:
         for ds, ds_labels in spec_dict['dataset_labels'].items():
             for ds_label in ds_labels:
@@ -68,17 +221,32 @@ def parse_spec(spec_dict: Mapping[str, Any],
 
 
 def validate_json(js: Dict[str, Dict[str, Any]],
-                  taxonomy_dict: Mapping[str, Set[Tuple[str, str]]]):
-    """Validates JSON"""
-    # maps label name to set of (dataset, dataset_label) tuples
-    label_to_inclusions = {}
-    seen = set()
+                  taxonomy_dict: Dict[Tuple[str, str], TaxonNode],
+                  allow_multilabel: bool) -> None:
+    """Validates JSON.
+
+    Args:
+        js: dict, Python dict representation of JSON file
+            see classification/README.md
+        taxonomy_dict: dict, maps (taxon_level, taxon_name) to a TaxonNode
+        allow_multilabel: bool, whether to allow a dataset label to be assigned
+            to multiple output labels
+    """
+    # maps output label name to set of (dataset, dataset_label) tuples
+    label_to_inclusions: Dict[str, Set[Tuple[str, str]]] = {}
     for label, spec_dict in js.items():
         include_set = parse_spec(spec_dict, taxonomy_dict)
         if 'exclude' in spec_dict:
             include_set -= parse_spec(spec_dict['exclude'], taxonomy_dict)
-        if seen.isdisjoint(include_set):
-            label_to_inclusions[label] = include_set
-        else:
-            raise ValueError('Intersection between sets!')
 
+        for label_b, set_b in label_to_inclusions.items():
+            if not include_set.isdisjoint(set_b):
+                print(f'Labels {label} and {label_b} will share images')
+                if not allow_multilabel:
+                    raise ValueError('Intersection between sets!')
+
+        label_to_inclusions[label] = include_set
+
+
+if __name__ == '__main__':
+    main()

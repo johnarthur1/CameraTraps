@@ -1,8 +1,16 @@
 """
 Converts CSV to JSON format for label specification.
 
+There are 3 possible values for the 'type' column in the CSV:
+- "row": this selects a specific rowfrom the master taxonomy CSV
+    content syntax: <dataset_name>|<dataset_label>
+- "datasettaxon": this selects all animals in a taxon from a particular dataset
+    content syntax: <dataset_name>|<taxon_level>|<taxon_name>
+- <taxon_level>: this selects all animals in a taxon across all datasets
+    content syntax: <taxon_name>
+
 Example CSV input:
-    class,type,content
+    output_label,type,content
 
     cervid,row,idfg|deer
     cervid,row,idfg|elk
