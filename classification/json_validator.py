@@ -1,11 +1,23 @@
-"""Validates the JSON file."""
+"""Validates a classification label specification JSON file and optionally
+outputs a JSON file listing the matching image files.
+
+Example usage:
+
+    python json_validator.py my_classes.json camera_trap_taxonomy_mapping.csv \
+        --output-json my_images.json --json-indent 4
+"""
+# allow forward references in typing annotations
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import time
 from typing import Any, Container, Dict, List, Mapping, Optional, Set, Tuple
 
 import pandas as pd
+
+from data_management.megadb.megadb_utils import MegadbUtils
 
 
 class TaxonNode:
@@ -95,16 +107,27 @@ class TaxonNode:
         return result
 
 
-def main():
+def main(input_json_path: str,
+         taxonomy_csv_path: str,
+         allow_multilabel: bool = False,
+         single_parent_taxonomy: bool = False,
+         output_json_path: str = None,
+         json_indent: Optional[int] = None):
     """Main function."""
-    args = _parse_args()
-    with open(args.input_json, 'r') as f:
+    with open(input_json_path, 'r') as f:
         js = json.load(f)
-    taxonomy_df = pd.read_csv(args.input_taxonomy_csv)
-    if args.single_parent_taxonomy:
+    taxonomy_df = pd.read_csv(taxonomy_csv_path)
+    if single_parent_taxonomy:
         TaxonNode.single_parent_only = True
     taxonomy_dict = build_taxonomy_dict(taxonomy_df)
-    validate_json(js, taxonomy_dict, allow_multilabel=args.allow_multilabel)
+    label_to_inclusions = validate_json(
+        js, taxonomy_dict, allow_multilabel=allow_multilabel)
+
+    # use MegaDB to generate list of images
+    if output_json_path is not None:
+        output_js = get_output_json(label_to_inclusions)
+        with open(output_json_path, 'w') as f:
+            json.dump(output_js, f, indent=json_indent)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -115,16 +138,22 @@ def _parse_args() -> argparse.Namespace:
         'input_json',
         help='path to JSON file containing label specification')
     parser.add_argument(
-        'input_taxonomy_csv',
+        'taxonomy_csv',
         help='path to taxonomy CSV file')
     parser.add_argument(
         '--allow-multilabel', action='store_true',
         help='flag that allows assigning a (dataset, dataset_label) pair to '
              'multiple output labels')
     parser.add_argument(
-        '--single_parent_taxonomy', action='store_true',
+        '--single-parent-taxonomy', action='store_true',
         help='flag that restricts the taxonomy to only allow a single parent '
              'for each taxon node')
+    parser.add_argument(
+        '--output-json',
+        help='path to output JSON file with list of images')
+    parser.add_argument(
+        '--json-indent', type=int, default=None,
+        help='number of spaces to use for JSON indent (default no indent)')
     return parser.parse_args()
 
 
@@ -222,7 +251,7 @@ def parse_spec(spec_dict: Mapping[str, Any],
 
 def validate_json(js: Dict[str, Dict[str, Any]],
                   taxonomy_dict: Dict[Tuple[str, str], TaxonNode],
-                  allow_multilabel: bool) -> None:
+                  allow_multilabel: bool) -> Dict[str, Set[Tuple[str, str]]]:
     """Validates JSON.
 
     Args:
@@ -231,6 +260,8 @@ def validate_json(js: Dict[str, Dict[str, Any]],
         taxonomy_dict: dict, maps (taxon_level, taxon_name) to a TaxonNode
         allow_multilabel: bool, whether to allow a dataset label to be assigned
             to multiple output labels
+
+    Returns: dict, maps label name to set of (dataset, dataset_label) tuples
     """
     # maps output label name to set of (dataset, dataset_label) tuples
     label_to_inclusions: Dict[str, Set[Tuple[str, str]]] = {}
@@ -246,7 +277,122 @@ def validate_json(js: Dict[str, Dict[str, Any]],
                     raise ValueError('Intersection between sets!')
 
         label_to_inclusions[label] = include_set
+    return label_to_inclusions
+
+
+def get_output_json(label_to_inclusions: Dict[str, Set[Tuple[str, str]]]
+                    ) -> Dict[str, Dict[str, Any]]:
+    """Queries MegaDB to get image paths matching dataset_labels.
+
+    Args:
+        label_to_inclusions: dict, maps label name to set of
+            (dataset, dataset_label) tuples, output of validate_json()
+
+    Returns: dict, maps image_path to a dict of properties
+    - 'dataset': str, name of dataset that image is from
+    - 'location': str or int, optional
+    - 'class': str, class label from the dataset
+    - 'label': str, assigned output label
+    - 'bbox': list of dicts, optional
+    """
+    # because MegaDB is organized by dataset, we do the same
+    # ds_to_labels = {
+    #     'dataset_name': {
+    #         'dataset_label': [output_label1, output_label2]
+    #     }
+    # }
+    ds_to_labels: Dict[str, Dict[str, List]] = {}
+    for output_label, ds_dslabels_set in label_to_inclusions.items():
+        for (ds, ds_label) in ds_dslabels_set:
+            if ds not in ds_to_labels:
+                ds_to_labels[ds] = {}
+            if ds_label not in ds_to_labels[ds]:
+                ds_to_labels[ds][ds_label] = []
+            ds_to_labels[ds][ds_label].append(output_label)
+
+
+    # we need the datasets table for getting full image paths
+    megadb = MegadbUtils()
+    datasets_table = megadb.get_datasets_table()
+
+    # The line
+    #    [img.class[0], seq.class[0]][0] as class
+    # selects the image-level class label if available. Otherwise it selects the
+    # sequence-level class label. This line assumes the following conditions,
+    # expressed in the WHERE clause:
+    # - at least one of the image or sequence class label is given
+    # - the image and sequence class labels are arrays with length at most 1
+    # - the image class label takes priority over the sequence class label
+    #
+    # In Azure Cosmos DB, if a field is not defined, then it is simply excluded
+    # from the result. For example, on the following JSON object,
+    #     {
+    #         "dataset": "camera_traps",
+    #         "seq_id": "1234",
+    #         "location": "A1",
+    #         "images": [{"file": "abcd.jpeg"}],
+    #         "class": ["deer"],
+    #     }
+    # the array [img.class[0], seq.class[0]] just gives ['deer'] because
+    # img.class is undefined and therefore excluded.
+    query = '''
+    SELECT
+        seq.dataset,
+        seq.location,
+        img.file,
+        [img.class[0], seq.class[0]][0] as class,
+        img.bbox
+    FROM sequences seq JOIN img IN seq.images
+    WHERE (ARRAY_LENGTH(img.class) = 1
+            AND ARRAY_CONTAINS(@dataset_labels, img.class[0])
+        )
+        OR (ARRAY_LENGTH(seq.class) = 1
+            AND ARRAY_CONTAINS(@dataset_labels, seq.class[0])
+            AND (ARRAY_LENGTH(img.class) = 0
+                OR NOT IS_DEFINED(img.class)
+                OR (ARRAY_LENGTH(img.class) = 1 AND img.class[0] = seq.class[0])
+            )
+        )
+    '''
+
+    output_json = {}  # maps full image path to json object
+    for ds in sorted(ds_to_labels.keys()):  # sort for determinism
+        ds_labels = sorted(ds_to_labels[ds].keys())
+        print(f'Querying dataset "{ds}" for dataset labels:', ds_labels)
+
+        start = time.time()
+        parameters = [dict(name='@dataset_labels', value=ds_labels)]
+        results = megadb.query_sequences_table(
+            query, partition_key=ds, parameters=parameters)
+        elapsed = time.time() - start
+        print(f'- query took {elapsed:.0f}s, found {len(results)} results')
+
+        # if no path prefix, set it to the empty string '', because
+        #     os.path.join('', x) = x
+        img_path_prefix = os.path.join(
+            datasets_table[ds]['container'],
+            datasets_table[ds].get('path_prefix', ''))
+        for result in results:
+            img_path = os.path.join(img_path_prefix, result['file'])
+            del result['file']
+            ds_label = result['class']
+            result['label'] = ds_to_labels[ds][ds_label]
+            output_json[img_path] = result
+
+    return output_json
 
 
 if __name__ == '__main__':
-    main()
+    args = _parse_args()
+    main(input_json_path=args.input_json,
+         taxonomy_csv_path=args.taxonomy_csv,
+         allow_multilabel=args.allow_multilabel,
+         single_parent_taxonomy=args.single_parent_taxonomy,
+         output_json_path=args.output_json,
+         json_indent=args.json_indent)
+
+# main(
+#     input_json_path='classification/idfg_classes.json',
+#     taxonomy_csv_path='../camera-traps-private/camera_trap_taxonomy_mapping.csv',
+#     output_json_path='classification/idfg_images.json',
+#     json_indent=4)
