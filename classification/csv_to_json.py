@@ -15,14 +15,9 @@ Example CSV input:
     cervid,row,idfg|deer
     cervid,row,idfg|elk
     cervid,row,idfg|prong
-    cervid,row,idfg|moose
-    cervid,row,idfg|wtd
-    cervid,row,idfg|md
     cervid,row,idfg_swwlf_2019|elk
     cervid,row,idfg_swwlf_2019|muledeer
     cervid,row,idfg_swwlf_2019|whitetaileddeer
-    cervid,row,idfg_swwlf_2019|moose
-    cervid,row,idfg_swwlf_2019|pronghorn
 
     cervid,family,cervidae
     cervid,datasettaxon,idfg|family|cervidae
@@ -39,9 +34,8 @@ Example JSON output:
     {
         "cervid": {
             "dataset_labels": {
-                "idfg": ["deer", "elk", "prong", "moose", "wtd", "md"],
-                "idfg_swwlf_2019": ["elk", "muledeer", "whitetaileddeer",
-                                    "moose", "pronghorn"]
+                "idfg": ["deer", "elk", "prong"],
+                "idfg_swwlf_2019": ["elk", "muledeer", "whitetaileddeer"]
             },
             "taxa": [
                 {
@@ -152,7 +146,7 @@ def parse_csv_row(obj: Dict[str, Any], rowtype: str, content: str) -> None:
 def csv_to_jsondict(csv_path: str) -> Dict[str, Dict[str, Any]]:
     """Converts CSV to json-style dictionary"""
     df = pd.read_csv(csv_path)
-    assert (df.columns == ['class', 'type', 'content']).all()
+    assert (df.columns == ['output_label', 'type', 'content']).all()
 
     js: Dict[str, Dict[str, Any]] = defaultdict(dict)
 

@@ -18,6 +18,7 @@ dependencies:
 - nb_conda_kernels
 - humanfriendly
 - jupyterlab
+- jsonpickle    # used by run_tf_detector_batch.py
 - matplotlib
 - mypy
 - pillow

@@ -1,6 +1,28 @@
 """Validates a classification label specification JSON file and optionally
 outputs a JSON file listing the matching image files.
 
+See README.md for an example of a classification label specification JSON file.
+
+The output JSON file looks like:
+
+{
+    "caltech/cct_images/59f79901-23d2-11e8-a6a3-ec086b02610b.jpg": {
+        "dataset": "caltech",
+        "location": 13,
+        "class": "mountain_lion",  # class from dataset
+        "bbox": [{"category": "animal",
+                  "bbox": [0, 0.347, 0.237, 0.257]}],
+        "label": ["monutain_lion"]  # labels to use in classifier
+    },
+    "caltech/cct_images/59f5fe2b-23d2-11e8-a6a3-ec086b02610b.jpg": {
+        "dataset": "caltech",
+        "location": 13,
+        "class": "mountain_lion",  # class from dataset
+        "label": ["monutain_lion"]  # labels to use in classifier
+    },
+    ...
+}
+
 Example usage:
 
     python json_validator.py my_classes.json camera_trap_taxonomy_mapping.csv \
@@ -114,17 +136,21 @@ def main(input_json_path: str,
          output_json_path: str = None,
          json_indent: Optional[int] = None):
     """Main function."""
-    with open(input_json_path, 'r') as f:
-        js = json.load(f)
+    print('Building taxonomy hierarchy')
     taxonomy_df = pd.read_csv(taxonomy_csv_path)
     if single_parent_taxonomy:
         TaxonNode.single_parent_only = True
     taxonomy_dict = build_taxonomy_dict(taxonomy_df)
+
+    print('Validating input json')
+    with open(input_json_path, 'r') as f:
+        js = json.load(f)
     label_to_inclusions = validate_json(
         js, taxonomy_dict, allow_multilabel=allow_multilabel)
 
     # use MegaDB to generate list of images
     if output_json_path is not None:
+        print('Generating output json')
         output_js = get_output_json(label_to_inclusions)
         with open(output_json_path, 'w') as f:
             json.dump(output_js, f, indent=json_indent)
@@ -365,14 +391,16 @@ def get_output_json(label_to_inclusions: Dict[str, Set[Tuple[str, str]]]
         results = megadb.query_sequences_table(
             query, partition_key=ds, parameters=parameters)
         elapsed = time.time() - start
-        print(f'- query took {elapsed:.0f}s, found {len(results)} results')
+        print(f'- query took {elapsed:.0f}s, found {len(results)} images')
 
         # if no path prefix, set it to the empty string '', because
         #     os.path.join('', x) = x
         img_path_prefix = os.path.join(
-            datasets_table[ds]['container'],
-            datasets_table[ds].get('path_prefix', ''))
+            ds, datasets_table[ds].get('path_prefix', ''))
         for result in results:
+            # result keys
+            # - already has: ['dataset', 'location', 'file', 'class', 'bbox']
+            # - add ['label'], remove ['file']
             img_path = os.path.join(img_path_prefix, result['file'])
             del result['file']
             ds_label = result['class']

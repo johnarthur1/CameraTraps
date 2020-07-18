@@ -6,13 +6,15 @@ Install miniconda3. Then create the conda environment using the following comman
 conda env update -f environment-classifier.yml --prune
 ```
 
-## JSON format
+## 1. Select classification labels for training.
 
-JSON format for specifying classification classes
+Create a classification labels specification JSON file. This file defines the labels that our classifier will be trained to distinguish, as well as the original dataset labels and/or biological taxons that will map to each classification label.
+
+The classification labels specification JSON file must have the following format:
 
 ```javascript
 {
-    // name of label
+    // name of classification label
     "cervid": {
 
         // select animals to include based on hierarchical taxonomy,
@@ -43,7 +45,7 @@ JSON format for specifying classification classes
         }
     },
 
-    // name of another label
+    // name of another classification label
     "bird": {
         "taxa": [
             {
