@@ -22,27 +22,17 @@ The classification labels specification JSON file must have the following format
         "taxa": [
             {
                 "level": "family",
-                "name": "cervidae"
-                // include all datasets if no "datasets" key given
-            },
-            {
-                "level": "family",
                 "name": "cervidae",
                 "datasets": ["idfg", "idfg_swwlf_2019"]
+                // include all datasets if no "datasets" key given
             }
         ],
 
         // select animals to include based on dataset labels
         "dataset_labels": {
-            "idfg": ["deer", "elk", "prong", "moose", "wtd", "md"],
-            "idfg_swwlf_2019": ["elk", "muledeer", "whitetaileddeer", "moose", "pronghorn"],
+            "idfg": ["deer", "elk", "prong"],
+            "idfg_swwlf_2019": ["elk", "muledeer", "whitetaileddeer"],
         },
-
-        // exclude animals using the same format
-        "exclude": {
-            "taxa": [],  // same format as "taxa" above
-            "dataset_labels": {}  // same format as "dataset_labels" above
-        }
     },
 
     // name of another classification label
@@ -56,13 +46,18 @@ The classification labels specification JSON file must have the following format
         "dataset_labels": {
             "idfg_swwlf_2019": ["bird"]
         }
+
+        // exclude animals using the same format
         "exclude": {
+            // same format as "taxa" above
             "taxa": [
                 {
                     "level": "genus",
                     "name": "meleagris"
                 }
             ],
+
+            // same format as "dataset_labels" above
             "dataset_labels": {
                 "idfg_swwlf_2019": ["turkey"]
             }
@@ -70,3 +65,49 @@ The classification labels specification JSON file must have the following format
     }
 }
 ```
+
+For convenience, we also permit defining the classification labels via a CSV file, which we then translate to JSON using `csv_to_json.py`. The CSV syntax is as follows:
+
+```
+output_label,type,content
+
+# select a specific row from the master taxonomy CSV
+<label>,row,<dataset_name>|<dataset_label>
+
+# select all animals in a taxon from a particular dataset
+<label>,datasettaxon,<dataset_name>|<taxon_level>|<taxon_name>
+
+# select all animals in a taxon across all datasets
+<label>,<taxon_level>,<taxon_name>
+
+# exclude certain rows or taxons
+!<label>,...
+```
+
+## 2. Validate the classification labels specification JSON file, and generate a list of images to run detection on.
+
+In `json_validator.py`, we validate the classification labels specification JSON file. It checks that the specified taxa are included in the master taxonomy CSV file, which specifies the biological taxonomy for every dataset label in MegaDB. The script then queries MegaDB to list all images that match the classification labels specification, and optionally verifies that each image is only assigned a single classification label.
+
+The output of `json_validator.py` is another JSON file that maps image names to a dictionary of properties:
+
+```javascript
+{
+    "caltech/cct_images/59f79901-23d2-11e8-a6a3-ec086b02610b.jpg": {
+        "dataset": "caltech",
+        "location": 13,
+        "class": "mountain_lion",  // class from dataset
+        "bbox": [{"category": "animal",
+                  "bbox": [0, 0.347, 0.237, 0.257]}],
+        "label": ["monutain_lion"]  // labels to use in classifier
+    },
+    "caltech/cct_images/59f5fe2b-23d2-11e8-a6a3-ec086b02610b.jpg": {
+        "dataset": "caltech",
+        "location": 13,
+        "class": "mountain_lion",  // class from dataset
+        "label": ["monutain_lion"]  // labels to use in classifier
+    },
+    ...
+}
+```
+
+## 3. Submit images without ground-truth bounding boxes to the MegaDetector Batch Processing API to get bounding box labels.

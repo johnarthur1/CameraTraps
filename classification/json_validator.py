@@ -9,16 +9,16 @@ The output JSON file looks like:
     "caltech/cct_images/59f79901-23d2-11e8-a6a3-ec086b02610b.jpg": {
         "dataset": "caltech",
         "location": 13,
-        "class": "mountain_lion",  # class from dataset
+        "class": "mountain_lion",  // class from dataset
         "bbox": [{"category": "animal",
                   "bbox": [0, 0.347, 0.237, 0.257]}],
-        "label": ["monutain_lion"]  # labels to use in classifier
+        "label": ["monutain_lion"]  // labels to use in classifier
     },
     "caltech/cct_images/59f5fe2b-23d2-11e8-a6a3-ec086b02610b.jpg": {
         "dataset": "caltech",
         "location": 13,
-        "class": "mountain_lion",  # class from dataset
-        "label": ["monutain_lion"]  # labels to use in classifier
+        "class": "mountain_lion",  // class from dataset
+        "label": ["monutain_lion"]  // labels to use in classifier
     },
     ...
 }
