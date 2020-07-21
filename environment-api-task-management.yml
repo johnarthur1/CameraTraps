@@ -1,10 +1,10 @@
-# conda activate cameratraps-api-job-management
+# conda activate cameratraps-api-task-management
 #
-# conda env update --name cameratraps-api-job-management --file environment-api-job-management.yml
-name: cameratraps-api-job-management
+# conda env update --name cameratraps-api-task-management --file environment-api-task-management.yml
+name: cameratraps-api-task-management
 
 dependencies:
-- python>=3.5   # known-compatible: 3.7
+- python>=3.6   # known-compatible: 3.7
 - ipykernel     # known-compatible: 5.1.4
 - humanfriendly # known-compatible: 8.1
 - matplotlib    # known-compatible: 3.1.3
@@ -18,6 +18,3 @@ dependencies:
 - pip:
   - azure-storage-blob>=12.3.0 # known-compatible 12.3.0
   - clipboard                  # known-compatible 0.0.4
-
-  
-  
