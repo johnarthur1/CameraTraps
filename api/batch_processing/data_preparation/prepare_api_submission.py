@@ -1,10 +1,10 @@
 """
 This module is somewhere between "documentation" and "code".  It is intended to
-capture the steps the precede running a job via the AI for Earth Camera Trap
+capture the steps the precede running a task via the AI for Earth Camera Trap
 Image Processing API, and it automates a couple of those steps.  We hope to
 gradually automate all of these.
 
-Here's the stuff we usually do before submitting a job:
+Here's the stuff we usually do before submitting a task:
 
 1) Upload data to Azure... we do this with azcopy, not addressed in this script
 
@@ -46,7 +46,7 @@ import ai4e_azure_utils  # from ai4eutils
 import path_utils  # from ai4eutils
 
 
-DEFAULT_N_FILES_PER_API_TASK = 1_000_000
+MAX_FILES_PER_API_TASK = 1_000_000
 
 VALID_REQUEST_NAME_CHARS = f'-_{string.ascii_letters}{string.digits}'
 REQUEST_NAME_CHAR_LIMIT = 100
@@ -66,7 +66,7 @@ def divide_chunks(l: Sequence[Any], n: int) -> List[Sequence[Any]]:
 
 def divide_files_into_tasks(
         file_list_json: str,
-        n_files_per_task: int = DEFAULT_N_FILES_PER_API_TASK
+        n_files_per_task: int = MAX_FILES_PER_API_TASK
         ) -> Tuple[List[str], List[Sequence[Any]]]:
     """
     Divides the file *file_list_json*, which contains a single json-encoded list
@@ -92,7 +92,7 @@ def divide_files_into_tasks(
     output_files = []
 
     for i_chunk, chunk in enumerate(chunks):
-        chunk_id = 'chunk{0:0>3d}'.format(i_chunk)
+        chunk_id = f'chunk{i_chunk:0>3d}'
         output_file = path_utils.insert_before_extension(
             file_list_json, chunk_id)
         output_files.append(output_file)
@@ -212,131 +212,101 @@ import requests
 ct_api_temp_dir = os.path.join(tempfile.gettempdir(),'camera_trap_api')
 IMAGES_PER_SHARD = 2000
 
-def fetch_task_status(endpoint_url,task_id):
+def fetch_task_status(endpoint_url: str, task_id: str) -> Tuple[Any, int]:
     """
     Currently a very thin wrapper to fetch the .json content from the task URL
 
-    Returns status dictionary,status code
+    Returns status dictionary, status code
     """
-    response = requests.get(urljoin(endpoint_url,str(task_id)))
-    return response.json(),response.status_code
+    response = requests.get(urljoin(endpoint_url, task_id))
+    return response.json(), response.status_code
 
 
-def get_output_file_urls(response):
+def get_output_file_urls(response: Mapping[str, Any]) -> Dict[str, str]:
     """
     Given the dictionary returned by fetch_task_status, get the set of
     URLs returned at the end of the task, or None if they're not available.
     """
     try:
         output_file_urls = response['Status']['message']['output_file_urls']
-    except:
+    except KeyError:
         return None
-    assert 'detections' in output_file_urls
-    assert 'failed_images' in output_file_urls
-    assert 'images' in output_file_urls
+    for key in ['detections', 'failed_images', 'images']:
+        assert key in output_file_urls
     return output_file_urls
 
 
-def download_url(url, destination_filename, verbose=False):
-    """
-    Download a URL to a local file
-    """
+def download_url(url: str, save_path: str, verbose: bool = False) -> None:
+    """Download a URL to a local file."""
     if verbose:
-        print('Downloading {} to {}'.format(url,destination_filename))
-    urllib.request.urlretrieve(url, destination_filename)
-    assert(os.path.isfile(destination_filename))
-    return destination_filename
+        print(f'Downloading {url} to {save_path}')
+    urllib.request.urlretrieve(url, save_path)
+    assert os.path.isfile(save_path)
 
 
-def get_temporary_filename():
-    os.makedirs(ct_api_temp_dir,exist_ok=True)
-    fn = os.path.join(ct_api_temp_dir,next(tempfile._get_candidate_names()))
-    return fn
-
-
-def download_to_temporary_file(url):
-    return download_url(url,get_temporary_filename())
-
-
-def get_missing_images(response,verbose=False):
+def get_missing_images(response: Mapping[str, Any], verbose: bool = False
+                       ) -> Optional[List[str]]:
     """
     Downloads and parses the list of submitted and processed images for a task,
-    and compares them to find missing images.  Double-checks that 'failed_images'
+    and compares them to find missing images. Double-checks that 'failed_images'
     is a subset of the missing images.
+
+    Returns: list of str, sorted list of missing image paths, or None if no
+        output_file_urls found in the response
     """
     output_file_urls = get_output_file_urls(response)
     if output_file_urls is None:
         return None
 
-    # Download all three urls to temporary files
-    #
-    # detections, failed_images, images
-    temporary_files = {}
-    for s in output_file_urls.keys():
-        temporary_files[s] = download_to_temporary_file(output_file_urls[s])
+    # estimate # of failed images from failed shards
+    n_failed_shards = response['Status']['message']['num_failed_shards']
+    estimated_failed_shard_images = n_failed_shards * IMAGES_PER_SHARD
 
-    # Load all three files
-    results = {}
-    for s in temporary_files.keys():
-        with open(temporary_files[s]) as f:
-            results[s] = json.load(f)
+    # Download all three JSON urls to memory
+    submitted_images = requests.get(output_file_urls['images']).json()
+    detections = requests.get(output_file_urls['detections']).json()
+    failed_images = requests.get(output_file_urls['failed_images']).json()
+
+    assert all(path_utils.find_image_strings(s) for s in submitted_images)
+    assert all(path_utils.find_image_strings(s) for s in failed_images)
 
     # Diff submitted and processed images
-    submitted_images = results['images']
-    if verbose:
-        print('Submitted {} images'.format(len(submitted_images)))
-
-    detections = results['detections']
     processed_images = [detection['file'] for detection in detections['images']]
-    if verbose:
-        print('Received results for {} images'.format(len(processed_images)))
+    missing_images = sorted(set(submitted_images) - set(processed_images))
 
-    failed_images = results['failed_images']
     if verbose:
-        print('{} failed images'.format(len(failed_images)))
-
-    n_failed_shards = int(response['Status']['message']['num_failed_shards'])
-    estimated_failed_shard_images = n_failed_shards * IMAGES_PER_SHARD
-    if verbose:
-        print('{} failed shards (approimately {} images)'.format(n_failed_shards,estimated_failed_shard_images))
-
-    missing_images = list(set(submitted_images) - set(processed_images))
-    if verbose:
-        print('{} images not in results'.format(len(missing_images)))
+        print(f'Submitted {len(submitted_images)} images')
+        print(f'Received results for {len(processed_images)} images')
+        print(f'{len(failed_images)} failed images')
+        print(f'{n_failed_shards} failed shards '
+              f'(~approx. {estimated_failed_shard_images} images)')
+        print(f'{len(missing_images)} images not in results')
 
     # Confirm that the failed images are a subset of the missing images
-    assert len(set(failed_images) - set(missing_images)) == 0, 'Failed images should be a subset of missing images'
-
-    for fn in temporary_files.values():
-        os.remove(fn)
+    assert set(failed_images) <= set(missing_images), (
+        'Failed images should be a subset of missing images')
 
     return missing_images
 
 
-def download_detection_results(endpoint_url,task_id,output_file):
-    """
-    Download the detection results .json file for a task
-    """
-    response,_ = fetch_task_status(endpoint_url,task_id)
-    output_file_urls = get_output_file_urls(response)
-    if output_file_urls is None:
-        return None
-    detection_url = output_file_urls['detections']
-    download_url(detection_url,output_file)
-    return response
+def generate_resubmission_list(response: Mapping[str, Any],
+                               resubmission_file_list_name: str
+                               ) -> Optional[List[str]]:
+    """Finds all image files that failed to process in a task and writes them to
+    a file.
 
+    Args:
+        response: dict, JSON response from Batch Processing API
+        resubmission_file_list_name: str, path to save resubmission file list
 
-def generate_resubmission_list(endpoint_url,task_id,resubmission_file_list_name):
+    Returns: list of str, sorted list of missing image paths, or None if no
+        output_file_urls found in the response
     """
-    Finds all the image files that failed to process in a job and writes them to a file.
-    """
-    response,_ = fetch_task_status(endpoint_url,task_id)
-    missing_files = get_missing_images(response)
-    missing_images = path_utils.find_image_strings(missing_files)
-    non_images = list(set(missing_files) - set(missing_images))
-    ai4e_azure_utils.write_list_to_file(
-        resubmission_file_list_name, missing_images)
-    return missing_images,non_images
+    missing_images = get_missing_images(response)
+    if missing_images is not None:
+        ai4e_azure_utils.write_list_to_file(
+            resubmission_file_list_name, missing_images)
+    return missing_images
 
 
 #%% Interactive driver
