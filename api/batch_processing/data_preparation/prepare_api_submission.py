@@ -37,19 +37,270 @@ Here's the stuff we usually do before submitting a task:
 """
 #%% Imports and constants
 
+from __future__ import annotations
+
+from enum import Enum
 import json
+import os
+import posixpath
 import string
-from typing import (
-    Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union)
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+import urllib
+
+import requests
 
 import ai4e_azure_utils  # from ai4eutils
 import path_utils  # from ai4eutils
 
 
 MAX_FILES_PER_API_TASK = 1_000_000
+IMAGES_PER_SHARD = 2000
 
 VALID_REQUEST_NAME_CHARS = f'-_{string.ascii_letters}{string.digits}'
-REQUEST_NAME_CHAR_LIMIT = 100
+REQUEST_NAME_CHAR_LIMIT = 92
+
+
+class BatchAPISubmissionError(Exception):
+    pass
+
+
+class TaskStatus(str, Enum):
+    RUNNING = 'running'
+    FAILED = 'failed'
+    PROBLEM = 'problem'
+    COMPLETED = 'completed'
+
+
+class Task:
+    """Represents a Batch Processing API task."""
+
+    # instance variables
+    name: str
+    local_images_list_path: str
+    remote_images_list_url: str
+    api_request: Dict[str, Any]
+    id: str
+    response: Dict[str, Any]
+
+    def __init__(self, name: str, images_list_path: str, local: bool,
+                 validate: bool = True):
+        """Initializes a Task.
+
+        If desired, validates that the images list does not exceed the maximum
+        length and that all files in the images list are actually images.
+
+        Args:
+            name: str, name of the request
+            images_list_path: str, path or URL to a JSON file containing a list
+                of image paths
+            local: bool, set to True if images_list_path is a local path,
+                set to False if images_list_path is a URL
+            validate: bool, whether to validate the given images list
+        """
+        clean_name = clean_request_name(name)
+        if name != clean_name:
+            print(f'Warning: renamed {name} to {clean_name}')
+        self.name = clean_name
+
+        if local:
+            self.local_images_list_path = images_list_path
+        else:
+            self.remote_images_list_url = images_list_path
+
+        if validate:
+            if local:
+                with open(images_list_path, 'r') as f:
+                    images_list = json.load(f)
+            else:
+                images_list = requests.get(images_list_path).json()
+
+            if len(images_list) > MAX_FILES_PER_API_TASK:
+                raise ValueError('images list has too many files')
+
+            for img_path in images_list:
+                if not path_utils.is_image_file(img_path):
+                    raise ValueError(f'{img_path} is not an image')
+
+    @classmethod
+    def from_task_id(cls, task_id: str, task_status_endpoint_url: str,
+                     name: Optional[str] = None) -> Task:
+        """Alternative constructor for a Task object from an existing task ID.
+
+        Args:
+            task_id: str, ID of a submitted task
+            task_status_endpoint_url: str
+            name: optional str, task name, defaults to task_id
+
+        Returns: dict, contains fields ['Status', 'TaskId'] and possibly others
+
+        Raises: requests.HTTPError, if an HTTP error occurred
+        """
+        url = posixpath.join(task_status_endpoint_url, task_id)
+        r = requests.get(url)
+
+        r.raise_for_status()
+        assert r.status_code == requests.codes.ok
+
+        response = r.json()
+        task = cls(name=name if name is not None else task_id,
+                   images_list_path=response['Status']['message']['images'],
+                   local=False)
+        task.id = task_id
+        task.response = response
+        return task
+
+    def upload_images_list(self, account: str, container: str, sas_token: str,
+                           blob_name: Optional[str] = None) -> None:
+        """Uploads the local images list to an Azure Blob Storage container.
+
+        Args:
+            account: str, Azure Storage account name
+            container: str, Azure Blob Storage container name
+            sas_token: str, Shared Access Signature (SAS) with write permission,
+                does not start with '?'
+            blob_name: optional str, defaults to basename of
+                self.local_images_list_path if blob_name is not given
+        """
+        if blob_name is None:
+            blob_name = os.path.basename(self.local_images_list_path)
+        blob_url = ai4e_azure_utils.upload_file_to_blob(
+            account_name=account, container_name=container,
+            local_path=self.local_images_list_path, blob_name=blob_name,
+            sas_token=sas_token)
+        self.remote_images_list_url = f'{blob_url}?{sas_token}'
+
+    def generate_api_request(self,
+                             caller: str,
+                             input_container_url: Optional[str] = None,
+                             image_path_prefix: Optional[str] = None,
+                             **kwargs: Any
+                             ) -> Dict[str, Any]:
+        """Generate API request JSON.
+
+        For complete list of API input parameters, see:
+        https://github.com/microsoft/CameraTraps/tree/master/api/batch_processing#api-inputs
+
+        Args:
+            caller: str
+            input_container_url: optional str, URL to Azure Blob Storage
+                container where images are stored. URL must include SAS token
+                with read and list permissions if the container is not public.
+                Only provide this parameter when the image paths in
+                self.remote_images_list_url are relative to a container.
+            image_path_prefix: optional str, TODO
+            kwargs: additional API input parameters
+
+        Returns: dict, represents the JSON request to be submitted
+        """
+        request = kwargs
+        request.update({
+            'request_name': self.name,
+            'caller': caller,
+            'images_requested_json_sas': self.remote_images_list_url
+        })
+        if input_container_url is None:
+            request['use_url'] = True  # TODO: check how `use_url` is used
+        else:
+            request['input_container_sas'] = input_container_url
+        if image_path_prefix is not None:
+            request['image_path_prefix'] = image_path_prefix
+        self.api_request = request
+        return request
+
+    def submit(self, request_endpoint_url: str) -> str:
+        """Submit this task to the Batch Processing API.
+
+        Only run this method after generate_api_request().
+
+        Args:
+            request_endpoint_url: str, URL of request endpoint
+
+        Returns: str, task ID
+
+        Raises:
+            requests.HTTPError, if an HTTP error occurred
+            BatchAPISubmissionError, if request returns an error
+        """
+        r = requests.post(request_endpoint_url, json=self.api_request)
+        r.raise_for_status()
+        assert r.status_code == requests.codes.ok
+
+        response = r.json()
+        if 'error' in response:
+            raise BatchAPISubmissionError(response['error'])
+        if 'request_id' not in response:
+            raise BatchAPISubmissionError(
+                f'"request_id" not in API response: {response}')
+        self.id = response['request_id']
+        return self.id
+
+    def check_status(self, task_status_endpoint_url: str) -> Dict[str, Any]:
+        """Fetch the .json content from the task URL
+
+        Args:
+            task_status_endpoint_url: str
+
+        Returns: dict, contains fields ['Status', 'TaskId'] and possibly others
+
+        Raises: requests.HTTPError, if an HTTP error occurred
+        """
+        url = posixpath.join(task_status_endpoint_url, self.id)
+        r = requests.get(url)
+
+        r.raise_for_status()
+        assert r.status_code == requests.codes.ok
+
+        self.response = r.json()
+        return self.response
+
+    def get_missing_images(self, verbose: bool = False) -> List[str]:
+        """Compares the submitted and processed images lists to find missing
+        images. Double-checks that 'failed_images' is a subset of the missing
+        images.
+
+        "missing": an image from the submitted list that was not processed,
+            for whatever reason
+        "failed": a missing image explicitly marked as 'failed' by the
+            batch processing API
+
+        Only run this method after check_status() returns a response where
+        response['Status']['request_status'] == TaskStatus.COMPLETED.
+
+        Returns: list of str, sorted list of missing image paths
+        """
+        assert self.response['Status']['request_status'] == TaskStatus.COMPLETED
+        message = self.response['Status']['message']
+
+        # estimate # of failed images from failed shards
+        n_failed_shards = message['num_failed_shards']
+        estimated_failed_shard_images = n_failed_shards * IMAGES_PER_SHARD
+
+        # Download all three JSON urls to memory
+        output_file_urls = message['output_file_urls']
+        submitted_images = requests.get(output_file_urls['images']).json()
+        detections = requests.get(output_file_urls['detections']).json()
+        failed_images = requests.get(output_file_urls['failed_images']).json()
+
+        assert all(path_utils.find_image_strings(s) for s in submitted_images)
+        assert all(path_utils.find_image_strings(s) for s in failed_images)
+
+        # Diff submitted and processed images
+        processed_images = [d['file'] for d in detections['images']]
+        missing_images = sorted(set(submitted_images) - set(processed_images))
+
+        if verbose:
+            print(f'Submitted {len(submitted_images)} images')
+            print(f'Received results for {len(processed_images)} images')
+            print(f'{len(failed_images)} failed images')
+            print(f'{n_failed_shards} failed shards '
+                  f'(~approx. {estimated_failed_shard_images} images)')
+            print(f'{len(missing_images)} images not in results')
+
+        # Confirm that the failed images are a subset of the missing images
+        assert set(failed_images) <= set(missing_images), (
+            'Failed images should be a subset of missing images')
+
+        return missing_images
 
 
 #%% Dividing files into multiple tasks
@@ -110,203 +361,12 @@ def clean_request_name(request_name: str,
         filename=request_name, whitelist=whitelist, char_limit=char_limit)
 
 
-def generate_api_queries(
-        input_container_sas_url: str,
-        file_list_sas_urls: Iterable[str],
-        request_name_base: str,
-        caller: str,
-        additional_args: Optional[Mapping] = None,
-        image_path_prefixes: Optional[Union[str, Sequence[str]]] = None
-        ) -> Tuple[List[str], List[Dict]]:
-    """Generates JSON-formatted API input from input parameters.
-
-    See
-    github.com/microsoft/CameraTraps/tree/master/api/batch_processing#api-inputs
-
-    Args:
-        input_container_sas_url: str, SAS URL with list and read permissions to
-            the Blob Storage container where the images are stored
-        file_list_sas_urls: list of str, SAS URLs to individual file lists,
-            all relative to the same container
-        request_name_base: str, request name for the set
-            if the base name is 'blah', individual requests will get request
-            names 'blah_chunk000', 'blah_chunk001', etc.
-        additional_args: dict, custom arguments to be added to each query
-            (to specify different custom args per query, use multiple calls to
-            generate_api_query())
-        image_path_prefixes: str or list of str, one per request
-
-    Returns:
-        request_strings: list of str, request_strings[i] is a JSON string
-            representation of request_dict[i]
-        request_dicts: list of dict, each dict contains the parameters for a
-            single request to be sent to the MegaDetector Batch Processing API
-    """
-    assert isinstance(file_list_sas_urls, list)
-
-    request_name_orig = request_name_base
-    request_name_base = clean_request_name(request_name_base)
-    if request_name_base != request_name_orig:
-        print(f'Warning: renamed {request_name_orig} to {request_name_base}')
-
-    request_dicts = []
-    request_strings = []
-    for i_url, file_list_sas_url in enumerate(file_list_sas_urls):
-        if len(file_list_sas_urls) > 1:
-            request_name = f'{request_name_base}_chunk{i_url:0>3d}'
-        else:
-            request_name = request_name_base
-
-        d = {
-            'input_container_sas': input_container_sas_url,
-            'images_requested_json_sas': file_list_sas_url,
-            'request_name': request_name,
-            'caller': caller,
-        }
-        if additional_args is not None:
-            d.update(additional_args)
-
-        if image_path_prefixes is not None:
-            if not isinstance(image_path_prefixes, list):
-                d['image_path_prefix'] = image_path_prefixes
-            else:
-                d['image_path_prefix'] = image_path_prefixes[i_url]
-        request_dicts.append(d)
-        request_strings.append(json.dumps(d, indent=1))
-
-    return request_strings, request_dicts
-
-
-def generate_api_query(input_container_sas_url: str,
-                       file_list_sas_url: str,
-                       request_name: str,
-                       caller: str,
-                       additional_args: Optional[Mapping] = None,
-                       image_path_prefix: Optional[str] = None):
-    """
-    Convenience function to call generate_api_queries for a single batch.
-
-    See generate_api_queries, and s/lists/single items.
-    """
-    file_list_sas_urls = [file_list_sas_url]
-    image_path_prefixes = None
-    if image_path_prefix is not None:
-        image_path_prefixes = [image_path_prefix]
-    request_strings, request_dicts = generate_api_queries(
-        input_container_sas_url, file_list_sas_urls, request_name, caller,
-        additional_args, image_path_prefixes)
-    return request_strings[0], request_dicts[0]
-
-
-#%% Tools for working with API output
-
-# I suspect this whole section will move to a separate file at some point,
-# so leaving these imports and constants here for now.
-from posixpath import join as urljoin
-
-import urllib
-import tempfile
-import os
-import requests
-
-ct_api_temp_dir = os.path.join(tempfile.gettempdir(),'camera_trap_api')
-IMAGES_PER_SHARD = 2000
-
-def fetch_task_status(endpoint_url: str, task_id: str) -> Tuple[Any, int]:
-    """
-    Currently a very thin wrapper to fetch the .json content from the task URL
-
-    Returns status dictionary, status code
-    """
-    response = requests.get(urljoin(endpoint_url, task_id))
-    return response.json(), response.status_code
-
-
-def get_output_file_urls(response: Mapping[str, Any]) -> Dict[str, str]:
-    """
-    Given the dictionary returned by fetch_task_status, get the set of
-    URLs returned at the end of the task, or None if they're not available.
-    """
-    try:
-        output_file_urls = response['Status']['message']['output_file_urls']
-    except KeyError:
-        return None
-    for key in ['detections', 'failed_images', 'images']:
-        assert key in output_file_urls
-    return output_file_urls
-
-
 def download_url(url: str, save_path: str, verbose: bool = False) -> None:
     """Download a URL to a local file."""
     if verbose:
         print(f'Downloading {url} to {save_path}')
     urllib.request.urlretrieve(url, save_path)
     assert os.path.isfile(save_path)
-
-
-def get_missing_images(response: Mapping[str, Any], verbose: bool = False
-                       ) -> Optional[List[str]]:
-    """
-    Downloads and parses the list of submitted and processed images for a task,
-    and compares them to find missing images. Double-checks that 'failed_images'
-    is a subset of the missing images.
-
-    Returns: list of str, sorted list of missing image paths, or None if no
-        output_file_urls found in the response
-    """
-    output_file_urls = get_output_file_urls(response)
-    if output_file_urls is None:
-        return None
-
-    # estimate # of failed images from failed shards
-    n_failed_shards = response['Status']['message']['num_failed_shards']
-    estimated_failed_shard_images = n_failed_shards * IMAGES_PER_SHARD
-
-    # Download all three JSON urls to memory
-    submitted_images = requests.get(output_file_urls['images']).json()
-    detections = requests.get(output_file_urls['detections']).json()
-    failed_images = requests.get(output_file_urls['failed_images']).json()
-
-    assert all(path_utils.find_image_strings(s) for s in submitted_images)
-    assert all(path_utils.find_image_strings(s) for s in failed_images)
-
-    # Diff submitted and processed images
-    processed_images = [detection['file'] for detection in detections['images']]
-    missing_images = sorted(set(submitted_images) - set(processed_images))
-
-    if verbose:
-        print(f'Submitted {len(submitted_images)} images')
-        print(f'Received results for {len(processed_images)} images')
-        print(f'{len(failed_images)} failed images')
-        print(f'{n_failed_shards} failed shards '
-              f'(~approx. {estimated_failed_shard_images} images)')
-        print(f'{len(missing_images)} images not in results')
-
-    # Confirm that the failed images are a subset of the missing images
-    assert set(failed_images) <= set(missing_images), (
-        'Failed images should be a subset of missing images')
-
-    return missing_images
-
-
-def generate_resubmission_list(response: Mapping[str, Any],
-                               resubmission_file_list_name: str
-                               ) -> Optional[List[str]]:
-    """Finds all image files that failed to process in a task and writes them to
-    a file.
-
-    Args:
-        response: dict, JSON response from Batch Processing API
-        resubmission_file_list_name: str, path to save resubmission file list
-
-    Returns: list of str, sorted list of missing image paths, or None if no
-        output_file_urls found in the response
-    """
-    missing_images = get_missing_images(response)
-    if missing_images is not None:
-        ai4e_azure_utils.write_list_to_file(
-            resubmission_file_list_name, missing_images)
-    return missing_images
 
 
 #%% Interactive driver
@@ -330,7 +390,7 @@ def generate_resubmission_list(response: Mapping[str, Any],
 #     #%%
 
 #     file_list_json = r"D:\temp\idfg_20190801-hddrop_image_list.json"
-#     task_files = prepare_api_submission.divide_files_into_tasks(file_list_json)
+#     task_files = divide_files_into_tasks(file_list_json)
 
 #     #%%
 

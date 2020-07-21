@@ -10,16 +10,18 @@ Terminology:
 """
 #%% Imports
 
-import itertools
 import json
 import ntpath
 import os
 import posixpath
+import pprint
 from urllib.parse import urlsplit, unquote
+from typing import Any, Dict, List
 
-import ai4e_azure_utils  # from ai4eutils
 import clipboard
 import humanfriendly
+
+import ai4e_azure_utils  # from ai4eutils
 import path_utils  # from ai4eutils
 import sas_blob_utils  # from ai4eutils
 
@@ -35,7 +37,7 @@ from api.batch_processing.postprocessing.postprocess_batch_results import (
 
 storage_account_name = 'blah'
 container_name = 'blah'
-taskgroup_base_name = 'institution-20191215'
+base_task_name = 'institution-20191215'
 base_output_folder_name = r'f:\institution'
 
 # Shared Access Signature (SAS) tokens for the Azure Blob Storage container.
@@ -69,7 +71,7 @@ folder_names = [''] # ['folder1', 'folder2', 'folder3']
 # But most of the time, you can ignore this.
 image_base = 'x:\\'
 
-additional_task_args = {}
+additional_task_args: Dict[str, Any] = {}
 
 # Supported model_versions: '4', '3', '4_prelim'
 #
@@ -98,7 +100,7 @@ write_sas_url = sas_blob_utils.build_azure_storage_uri(
     sas_token=read_write_sas_token)
 
 # local folders
-filename_base = os.path.join(base_output_folder_name, taskgroup_base_name)
+filename_base = os.path.join(base_output_folder_name, base_task_name)
 raw_api_output_folder = os.path.join(filename_base, 'raw_api_outputs')
 combined_api_output_folder = os.path.join(filename_base, 'combined_api_outputs')
 postprocessing_output_folder = os.path.join(filename_base, 'postprocessing')
@@ -151,7 +153,7 @@ file_lists_by_folder = []
 # folder_name = folder_names[0]
 for folder_name in folder_names:
     clean_folder_name = path_utils.clean_filename(folder_name)
-    json_filename = f'{taskgroup_base_name}_{clean_folder_name}_all.json'
+    json_filename = f'{base_task_name}_{clean_folder_name}_all.json'
     list_file = os.path.join(filename_base, json_filename)
 
     # If this is intended to be a folder, it needs to end in '/', otherwise
@@ -192,69 +194,54 @@ for list_file in file_lists_by_folder:
 assert len(folder_chunks) == len(folder_names)
 
 
-#%% Copy image lists to blob storage for each task
+#%% Create taskgroups and tasks, and upload image lists to blob storage
 
-# Maps task name to a remote path
-task_name_to_list_url = {}
-task_names_by_taskgroup = []
+task_names = set()
+taskgroups: List[List[prepare_api_submission.Task]] = []
 
-# chunked_folder_files = folder_chunks[0]; chunk_file = chunked_folder_files[0]
-for chunked_folder_files in folder_chunks:
+for i, taskgroup_json_paths in enumerate(folder_chunks):
 
-    task_names_this_taskgroup = []
-
-    for chunk_path in chunked_folder_files:
+    taskgroup = []
+    for j, task_json_path in enumerate(taskgroup_json_paths):
 
         # periods not allowed in task names
-        chunk_filename = ntpath.basename(chunk_path)
-        task_name = f'{taskgroup_base_name}_{os.path.splitext(chunk_filename)[0]}'
-        task_name = task_name.replace('.', '_')
-        assert task_name not in task_name_to_list_url
+        task_json_filename = ntpath.basename(task_json_path)
+        task_json_filename_root = os.path.splitext(task_json_filename)[0]
+        task_name = f'{base_task_name}_{task_json_filename_root}'.replace(
+            '.', '_')
+        assert task_name not in task_names
+        task_names.add(task_name)
+        task = prepare_api_submission.Task(
+            name=task_name, images_list_path=task_json_path, local=True)
 
-        blob_name = f'api_inputs/{taskgroup_base_name}/{chunk_filename}'
-        print(f'Task {task_name}: uploading {chunk_path} to {blob_name}')
-        ai4e_azure_utils.upload_file_to_blob(
-            account_name=storage_account_name, container_name=container_name,
-            local_path=chunk_path, blob_name=blob_name,
-            sas_token=read_write_sas_token)
-        list_url = read_only_sas_url.replace('?', f'/{blob_name}?')
-        task_name_to_list_url[task_name] = list_url
-        task_names_this_taskgroup.append(task_name)
+        blob_name = f'api_inputs/{base_task_name}/{task_json_filename}'
+        print(f'Task {task_name}: uploading {task_json_path} to {blob_name}')
+        task.upload_images_list(
+            account=storage_account_name, container=container_name,
+            sas_token=read_write_sas_token, blob_name=blob_name)
 
-    task_names_by_taskgroup.append(task_names_this_taskgroup)
+        taskgroup.append(task)
 
-    # ...for each task within this taskgroup
+    taskgroups.append(taskgroup)
 
-# ...for each folder
+assert len(taskgroups) == len(folder_names)
 
 
 #%% Generate API calls for each task
 
-request_strings_by_taskgroup = []
+request_strings = []
 
-# task_name = list(task_name_to_list_url.keys())[0]
-for taskgroup_task_names in task_names_by_taskgroup:
-
-    request_strings_this_taskgroup = []
-
-    for task_name in taskgroup_task_names:
-        list_url = task_name_to_list_url[task_name]
-        s, _ = prepare_api_submission.generate_api_query(
-            input_container_sas_url=read_only_sas_url,
-            file_list_sas_url=list_url,
-            request_name=task_name,
+for taskgroup in taskgroups:
+    for task in taskgroup:
+        request = task.generate_api_request(
             caller=caller,
-            additional_args=additional_task_args,
-            image_path_prefix=None)
-        request_strings_this_taskgroup.append(s)
+            input_container_url=read_only_sas_url,
+            image_path_prefix=None,
+            **additional_task_args)
+        request_str = json.dumps(request, indent=1)
+        request_strings.append(request_str)
 
-    request_strings_by_taskgroup.append(request_strings_this_taskgroup)
-
-request_strings = list(
-    itertools.chain.from_iterable(request_strings_by_taskgroup))
-
-for s in request_strings:
-    print(s)
+pprint.pprint(request_strings)
 
 clipboard.copy('\n\n'.join(request_strings))
 
@@ -263,40 +250,10 @@ clipboard.copy('\n\n'.join(request_strings))
 
 # Not working yet, something is wrong with my post call
 
-task_ids_by_taskgroup = []
-
-# taskgroup_request_strings = request_strings_by_taskgroup[0]
-# request_string = taskgroup_request_strings[0]
-for taskgroup_request_strings in request_strings_by_taskgroup:
-
-    task_ids_this_taskgroup = []
-    for request_string in taskgroup_request_strings:
-
-        request_string = request_string.replace('\n', '')
-        # response = requests.post(SUBMISSION_ENDPOINT_URL, json=request_string)
-        # print(response.json())
-        task_id = 0
-        task_ids_this_taskgroup.append(task_id)
-
-    task_ids_by_taskgroup.append(task_ids_this_taskgroup)
-
-  # for each string in this task group
-
-# for each task group
-
-# List of task IDs, grouped by logical taskgroup
-taskgroups = task_ids_by_taskgroup
-
-
-#%% Manually define task groups if we ran the tasks manually
-
-# The nested lists will make sense below, I promise.
-
-# For just one task...
-taskgroups = [["9999"]]
-
-# For multiple tasks...
-taskgroups = [["1111"], ["2222"], ["3333"]]
+for taskgroup in taskgroups:
+    for task in taskgroup:
+        task_id = task.submit(SUBMISSION_ENDPOINT_URL)
+        print(task.name, task_id)
 
 
 #%% Estimate total time
@@ -314,70 +271,90 @@ expected_seconds = (0.8 / 16) * n_images
 print(f'Expected time: {humanfriendly.format_timespan(expected_seconds)}')
 
 
+#%% Manually define task groups if we ran the tasks manually
+
+# The nested lists will make sense below, I promise.
+
+# For just one task...
+taskgroup_ids = [["9999"]]
+
+# For multiple tasks...
+taskgroup_ids = [["1111"], ["2222"], ["3333"]]
+
+for i, taskgroup in enumerate(taskgroups):
+    for j, task in enumerate(taskgroup):
+        task.id = taskgroup_ids[i][j]
+
+
 #%% Status check
 
 for taskgroup in taskgroups:
-    for task_id in taskgroup:
-        response, status = prepare_api_submission.fetch_task_status(
-            TASK_STATUS_ENDPOINT_URL, task_id)
-        assert status == 200
+    for task in taskgroup:
+        response = task.check_status(TASK_STATUS_ENDPOINT_URL)
         print(response)
 
 
 #%% Look for failed shards or missing images, start new tasks if necessary
 
 n_resubmissions = 0
+resubmitted_tasks = []
 
 # i_taskgroup = 0; taskgroup = taskgroups[i_taskgroup]; task_id = taskgroup[0]
 for i_taskgroup, taskgroup in enumerate(taskgroups):
 
-    for task_id in taskgroup:
+    tasks = list(taskgroup)  # make a copy, because we append to taskgroup
+    for task in tasks:
 
-        response, status = prepare_api_submission.fetch_task_status(
-            TASK_STATUS_ENDPOINT_URL, task_id)
-        assert status == 200
+        response = task.check_status(TASK_STATUS_ENDPOINT_URL)
+
         n_failed_shards = response['Status']['message']['num_failed_shards']
-
-        # assert n_failed_shards == 0
-
         if n_failed_shards != 0:
-            print(f'Warning: {n_failed_shards} failed shards for task {task_id}')
+            print(f'Warning: {n_failed_shards} failed shards for task '
+                  f'{task.id}')
 
-        output_file_urls = prepare_api_submission.get_output_file_urls(response)
+        output_file_urls = response['Status']['message']['output_file_urls']
         detections_url = output_file_urls['detections']
         fn = url_to_filename(detections_url)
 
         # Each taskgroup corresponds to one of our folders
+        folder_name = folder_names[i_taskgroup]
         clean_folder_name = prepare_api_submission.clean_request_name(
-            folder_names[i_taskgroup])
-        assert (folder_names[i_taskgroup] in fn or clean_folder_name in fn)
+            folder_name)
+        assert (folder_name in fn) or (clean_folder_name in fn)
         assert 'chunk' in fn
 
         missing_images_fn = os.path.join(
             raw_api_output_folder, fn.replace('.json', '_missing.json'))
 
-        missing_images = prepare_api_submission.generate_resubmission_list(
-            response, missing_images_fn)
-
-        if len(missing_images) < max_tolerable_missing_images:
+        missing_imgs = task.get_missing_images(verbose=True)
+        ai4e_azure_utils.write_list_to_file(missing_images_fn, missing_imgs)
+        num_missing_imgs = len(missing_imgs)
+        if num_missing_imgs < max_tolerable_missing_images:
             continue
 
-        print(f'Warning: {len(missing_images)} missing images for task {task_id}')
-
-        task_name = f'{taskgroup_base_name}_{folder_names[i_taskgroup]}_{task_id}_missing_images'
-        blob_name = f'api_inputs/{taskgroup_base_name}/{task_name}.json'
+        print(f'Warning: {missing_imgs} missing images for task {task.id}')
+        task_name = f'{base_task_name}_{folder_name}_{task.id}_missing_images'
+        blob_name = f'api_inputs/{base_task_name}/{task_name}.json'
+        new_task = prepare_api_submission.Task(
+            name=task_name, images_list_path=missing_images_fn, local=True)
         print(f'Task {task_name}: uploading {missing_images_fn} to {blob_name}')
-        ai4e_azure_utils.upload_file_to_blob(
-            account_name=storage_account_name, container_name=container_name,
-            local_path=missing_images_fn, blob_name=blob_name,
-            sas_token=read_write_sas_token)
-        list_url = read_only_sas_url.replace('?', f'/{blob_name}?')
-        s, _ = prepare_api_submission.generate_api_query(
-            read_only_sas_url, list_url, task_name, caller,
-            image_path_prefix=None)
+        new_task.upload_images_list(
+            account=storage_account_name, container=container_name,
+            blob_name=blob_name, sas_token=read_write_sas_token)
+        request = new_task.generate_api_request(
+            caller=caller, input_container_url=read_only_sas_url,
+            image_path_prefix=None, **additional_task_args)
 
+        taskgroup.append(new_task)
+        resubmitted_tasks.append(new_task)
+
+        # automatic submission
+        # new_task.submit(SUBMISSION_ENDPOINT_URL)
+
+        # manual submission
         print(f'\nResbumission task for {task_id}:\n')
-        print(s)
+        print(json.dumps(request, indent=1))
+
         n_resubmissions += 1
 
     # ...for each task
@@ -393,15 +370,18 @@ if n_resubmissions == 0:
 if False:
 
     #%%
-
-    resubmission_tasks = ['1222']
-    for task_id in resubmission_tasks:
-        response, status = prepare_api_submission.fetch_task_status(
-            TASK_STATUS_ENDPOINT_URL, task_id)
-        assert status == 200
+    for task in resubmitted_tasks:
+        response = task.check_status(TASK_STATUS_ENDPOINT_URL)
         print(response)
 
-    taskgroups = [['2233', '9484', '1222'], ['1197', '1702', '2764']]
+    taskgroup_ids = [['2233', '9484', '1222'], ['1197', '1702', '2764']]
+
+    for i, taskgroup in enumerate(taskgroups):
+        for j, task in enumerate(taskgroup):
+            if hasattr(task, 'id'):
+                assert task.id == taskgroup_ids[i][j]
+            else:
+                task.id = taskgroup_ids[i][j]
 
 
 #%% Pull results
@@ -411,27 +391,27 @@ task_id_to_results_file = {}
 # i_taskgroup = 0; taskgroup = taskgroups[i_taskgroup]; task_id = taskgroup[0]
 for i_taskgroup, taskgroup in enumerate(taskgroups):
 
-    for task_id in taskgroup:
+    for task in taskgroup:
 
-        response, status = prepare_api_submission.fetch_task_status(
-            TASK_STATUS_ENDPOINT_URL, task_id)
-        assert status == 200
+        response = task.check_status(TASK_STATUS_ENDPOINT_URL)
 
-        output_file_urls = prepare_api_submission.get_output_file_urls(response)
+        output_file_urls = response['Status']['message']['output_file_urls']
         detections_url = output_file_urls['detections']
         fn = url_to_filename(detections_url)
 
-        # n_failed_shards = int(response['status']['message']['num_failed_shards'])
+        # n_failed_shards = response['status']['message']['num_failed_shards']
         # assert n_failed_shards == 0
 
-        # Each task group corresponds to one of our folders
-        assert (folder_names[i_taskgroup] in fn) or \
-            (prepare_api_submission.clean_request_name(folder_names[i_taskgroup]) in fn)
+        # Each taskgroup corresponds to one of our folders
+        folder_name = folder_names[i_taskgroup]
+        clean_folder_name = prepare_api_submission.clean_request_name(
+            folder_name)
+        assert (folder_name in fn) or (clean_folder_name in fn)
         assert 'chunk' in fn or 'missing' in fn
 
         output_file = os.path.join(raw_api_output_folder, fn)
         prepare_api_submission.download_url(detections_url, output_file)
-        task_id_to_results_file[task_id] = output_file
+        task_id_to_results_file[task.id] = output_file
 
     # ...for each task
 
@@ -442,37 +422,35 @@ for i_taskgroup, taskgroup in enumerate(taskgroups):
 
 folder_name_to_combined_output_file = {}
 
-# i_folder = 0; folder_name = folder_names[i_folder]
-for i_folder, folder_name_raw in enumerate(folder_names):
+for i_taskgroup, taskgroup in enumerate(taskgroups):
 
+    folder_name_raw = folder_names[i_taskgroup]
     folder_name = path_utils.clean_filename(folder_name_raw)
     print(f'Combining results for {folder_name}')
 
-    # task_id = taskgroups[i_folder][0]
     results_files = []
-    for task_id in taskgroups[i_folder]:
-        raw_output_file = task_id_to_results_file[task_id]
+    for task in taskgroup:
+        raw_output_file = task_id_to_results_file[task.id]
         results_files.append(raw_output_file)
 
     combined_api_output_file = os.path.join(
         combined_api_output_folder,
-        f'{taskgroup_base_name}{folder_name}_detections.json')
+        f'{base_task_name}{folder_name}_detections.json')
 
     print(f'Combining the following into {combined_api_output_file}')
-    for fn in results_files:
-        print(fn)
+    pprint.pprint(results_files)
 
     combine_api_outputs.combine_api_output_files(
         results_files, combined_api_output_file)
     folder_name_to_combined_output_file[folder_name] = combined_api_output_file
 
     # Check that we have (almost) all the images
-    list_file = file_lists_by_folder[i_folder]
-    requested_images = json.load(open(list_file, 'r'))
-    results = json.load(open(combined_api_output_file, 'r'))
-    result_images = [im['file'] for im in results['images']]
-    requested_images_set = set(requested_images)
-    result_images_set = set(result_images)
+    list_file = file_lists_by_folder[i_taskgroup]
+    with open(list_file, 'r') as f:
+        requested_images_set = set(json.load(f))
+    with open(combined_api_output_file, 'r') as f:
+        results = json.load(f)
+        result_images_set = set(im['file'] for im in results['images'])
     missing_files = requested_images_set - result_images_set
     missing_images = path_utils.find_image_strings(missing_files)
     if len(missing_images) > 0:
@@ -511,7 +489,7 @@ for i_folder, folder_name_raw in enumerate(folder_names):
     else:
         folder_token = folder_name + '_'
     output_base = os.path.join(postprocessing_output_folder, folder_token + \
-        taskgroup_base_name + '_{:.3f}'.format(options.confidence_threshold))
+        base_task_name + '_{:.3f}'.format(options.confidence_threshold))
     os.makedirs(output_base, exist_ok=True)
     print('Processing {} to {}'.format(folder_name, output_base))
     api_output_file = folder_name_to_combined_output_file[folder_name]
@@ -612,7 +590,7 @@ for i_folder, folder_name_raw in enumerate(folder_names):
     else:
         folder_token = folder_name + '_'
     output_base = os.path.join(postprocessing_output_folder, folder_token + \
-        taskgroup_base_name + '_{}_{:.3f}'.format(rde_string, options.confidence_threshold))
+        base_task_name + '_{}_{:.3f}'.format(rde_string, options.confidence_threshold))
     os.makedirs(output_base, exist_ok=True)
     print('Processing {} to {}'.format(folder_name, output_base))
     # api_output_file = folder_name_to_combined_output_file[folder_name]
