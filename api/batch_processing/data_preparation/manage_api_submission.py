@@ -89,9 +89,6 @@ additional_task_args: Dict[str, Any] = {}
 
 assert len(folder_names) != 0
 
-TASK_STATUS_ENDPOINT_URL = f'{ENDPOINT_BASE}/task'
-SUBMISSION_ENDPOINT_URL = f'{ENDPOINT_BASE}/request_detections'
-
 read_only_sas_url = sas_blob_utils.build_azure_storage_uri(
     account=storage_account_name, container=container_name,
     sas_token=read_only_sas_token)
@@ -212,7 +209,8 @@ for i, taskgroup_json_paths in enumerate(folder_chunks):
         assert task_name not in task_names
         task_names.add(task_name)
         task = prepare_api_submission.Task(
-            name=task_name, images_list_path=task_json_path, local=True)
+            name=task_name, images_list_path=task_json_path,
+            api_url=ENDPOINT_BASE)
 
         blob_name = f'api_inputs/{base_task_name}/{task_json_filename}'
         print(f'Task {task_name}: uploading {task_json_path} to {blob_name}')
@@ -252,7 +250,7 @@ clipboard.copy('\n\n'.join(request_strings))
 
 for taskgroup in taskgroups:
     for task in taskgroup:
-        task_id = task.submit(SUBMISSION_ENDPOINT_URL)
+        task_id = task.submit()
         print(task.name, task_id)
 
 
@@ -290,7 +288,7 @@ for i, taskgroup in enumerate(taskgroups):
 
 for taskgroup in taskgroups:
     for task in taskgroup:
-        response = task.check_status(TASK_STATUS_ENDPOINT_URL)
+        response = task.check_status()
         print(response)
 
 
@@ -305,7 +303,7 @@ for i_taskgroup, taskgroup in enumerate(taskgroups):
     tasks = list(taskgroup)  # make a copy, because we append to taskgroup
     for task in tasks:
 
-        response = task.check_status(TASK_STATUS_ENDPOINT_URL)
+        response = task.check_status()
 
         n_failed_shards = response['Status']['message']['num_failed_shards']
         if n_failed_shards != 0:
@@ -336,7 +334,8 @@ for i_taskgroup, taskgroup in enumerate(taskgroups):
         task_name = f'{base_task_name}_{folder_name}_{task.id}_missing_images'
         blob_name = f'api_inputs/{base_task_name}/{task_name}.json'
         new_task = prepare_api_submission.Task(
-            name=task_name, images_list_path=missing_images_fn, local=True)
+            name=task_name, images_list_path=missing_images_fn,
+            api_url=ENDPOINT_BASE)
         print(f'Task {task_name}: uploading {missing_images_fn} to {blob_name}')
         new_task.upload_images_list(
             account=storage_account_name, container=container_name,
@@ -349,7 +348,7 @@ for i_taskgroup, taskgroup in enumerate(taskgroups):
         resubmitted_tasks.append(new_task)
 
         # automatic submission
-        # new_task.submit(SUBMISSION_ENDPOINT_URL)
+        # new_task.submit()
 
         # manual submission
         print(f'\nResbumission task for {task_id}:\n')
@@ -371,7 +370,7 @@ if False:
 
     #%%
     for task in resubmitted_tasks:
-        response = task.check_status(TASK_STATUS_ENDPOINT_URL)
+        response = task.check_status()
         print(response)
 
     taskgroup_ids = [['2233', '9484', '1222'], ['1197', '1702', '2764']]
@@ -393,7 +392,7 @@ for i_taskgroup, taskgroup in enumerate(taskgroups):
 
     for task in taskgroup:
 
-        response = task.check_status(TASK_STATUS_ENDPOINT_URL)
+        response = task.check_status()
 
         output_file_urls = response['Status']['message']['output_file_urls']
         detections_url = output_file_urls['detections']

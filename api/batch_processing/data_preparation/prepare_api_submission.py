@@ -1,7 +1,7 @@
 """
 This module is somewhere between "documentation" and "code".  It is intended to
 capture the steps the precede running a task via the AI for Earth Camera Trap
-Image Processing API, and it automates a couple of those steps.  We hope to
+Image Detection API, and it automates a couple of those steps.  We hope to
 gradually automate all of these.
 
 Here's the stuff we usually do before submitting a task:
@@ -72,18 +72,32 @@ class TaskStatus(str, Enum):
 
 
 class Task:
-    """Represents a Batch Processing API task."""
+    """Represents a Batch Detection API task.
 
-    # instance variables
+    Given the Batch Detection API URL, assumes that the endpoints are:
+        /request_detections
+            for submitting tasks
+        /task/<task.id>
+            for checking on task status
+    """
+
+    # class variables
+    request_endpoint = 'request_detections'   # for submitting tasks
+    task_status_endpoint = 'task'             # for checking task status
+
+    # instance variables, in order of when they are typically set
     name: str
+    api_url: str
     local_images_list_path: str
-    remote_images_list_url: str
+    remote_images_list_url: str  # includes SAS token if uploaded with one
     api_request: Dict[str, Any]
     id: str
     response: Dict[str, Any]
+    status: TaskStatus
 
-    def __init__(self, name: str, images_list_path: str, local: bool,
-                 validate: bool = True):
+    def __init__(self, name: str, task_id: Optional[str] = None,
+                 images_list_path: Optional[str] = None,
+                 validate: bool = True, api_url: Optional[str] = None):
         """Initializes a Task.
 
         If desired, validates that the images list does not exceed the maximum
@@ -91,63 +105,61 @@ class Task:
 
         Args:
             name: str, name of the request
+            task_id: optional str, ID of submitted task
             images_list_path: str, path or URL to a JSON file containing a list
-                of image paths
+                of image paths, must start with 'http' if a URL
             local: bool, set to True if images_list_path is a local path,
                 set to False if images_list_path is a URL
-            validate: bool, whether to validate the given images list
+            validate: bool, whether to validate the given images list,
+                only used if images_list_path is not None
+            api_url: optional str, Batch Detection API URL,
+                defaults to environment variable BATCH_DETECTION_API_URL
+
+        Raises: requests.HTTPError, if task_id is given and an HTTP error
+            occurred
         """
         clean_name = clean_request_name(name)
         if name != clean_name:
             print(f'Warning: renamed {name} to {clean_name}')
         self.name = clean_name
 
-        if local:
-            self.local_images_list_path = images_list_path
-        else:
-            self.remote_images_list_url = images_list_path
+        if api_url is None:
+            api_url = os.environ['BATCH_DETECTION_API_URL']
+        assert api_url is not None and api_url != ''
+        self.api_url = api_url
 
-        if validate:
-            if local:
-                with open(images_list_path, 'r') as f:
-                    images_list = json.load(f)
+        if images_list_path is not None:
+            if images_list_path.startswith('http'):
+                self.remote_images_list_url = images_list_path
             else:
-                images_list = requests.get(images_list_path).json()
+                self.local_images_list_path = images_list_path
 
-            if len(images_list) > MAX_FILES_PER_API_TASK:
-                raise ValueError('images list has too many files')
+            if validate:
+                if images_list_path.startswith('http'):
+                    images_list = requests.get(images_list_path).json()
+                else:
+                    with open(images_list_path, 'r') as f:
+                        images_list = json.load(f)
 
-            for img_path in images_list:
-                if not path_utils.is_image_file(img_path):
-                    raise ValueError(f'{img_path} is not an image')
+                if len(images_list) > MAX_FILES_PER_API_TASK:
+                    raise ValueError('images list has too many files')
 
-    @classmethod
-    def from_task_id(cls, task_id: str, task_status_endpoint_url: str,
-                     name: Optional[str] = None) -> Task:
-        """Alternative constructor for a Task object from an existing task ID.
+                # If images_list contains URLs, strip away any query strings
+                # '?...'. This should have no adverse effect on local paths.
+                for img_path in images_list:
+                    stripped_img_path = urllib.parse.urlparse(img_path).path
+                    if not path_utils.is_image_file(stripped_img_path):
+                        raise ValueError(f'{img_path} is not an image')
 
-        Args:
-            task_id: str, ID of a submitted task
-            task_status_endpoint_url: str
-            name: optional str, task name, defaults to task_id
+        if task_id is not None:
+            self.id = task_id
+            self.check_status()
 
-        Returns: dict, contains fields ['Status', 'TaskId'] and possibly others
-
-        Raises: requests.HTTPError, if an HTTP error occurred
-        """
-        url = posixpath.join(task_status_endpoint_url, task_id)
-        r = requests.get(url)
-
-        r.raise_for_status()
-        assert r.status_code == requests.codes.ok
-
-        response = r.json()
-        task = cls(name=name if name is not None else task_id,
-                   images_list_path=response['Status']['message']['images'],
-                   local=False)
-        task.id = task_id
-        task.response = response
-        return task
+    def __repr__(self) -> str:
+        return 'Task(name={name}, id={id}, status={status})'.format(
+            name=self.name,
+            id=getattr(self, 'id', None),
+            status=getattr(self, 'status', None))
 
     def upload_images_list(self, account: str, container: str, sas_token: str,
                            blob_name: Optional[str] = None) -> None:
@@ -163,11 +175,10 @@ class Task:
         """
         if blob_name is None:
             blob_name = os.path.basename(self.local_images_list_path)
-        blob_url = ai4e_azure_utils.upload_file_to_blob(
+        self.remote_images_list_url = ai4e_azure_utils.upload_file_to_blob(
             account_name=account, container_name=container,
             local_path=self.local_images_list_path, blob_name=blob_name,
             sas_token=sas_token)
-        self.remote_images_list_url = f'{blob_url}?{sas_token}'
 
     def generate_api_request(self,
                              caller: str,
@@ -207,13 +218,10 @@ class Task:
         self.api_request = request
         return request
 
-    def submit(self, request_endpoint_url: str) -> str:
-        """Submit this task to the Batch Processing API.
+    def submit(self) -> str:
+        """Submit this task to the Batch Detection API.
 
         Only run this method after generate_api_request().
-
-        Args:
-            request_endpoint_url: str, URL of request endpoint
 
         Returns: str, task ID
 
@@ -221,7 +229,8 @@ class Task:
             requests.HTTPError, if an HTTP error occurred
             BatchAPISubmissionError, if request returns an error
         """
-        r = requests.post(request_endpoint_url, json=self.api_request)
+        request_endpoint = posixpath.join(self.api_url, self.request_endpoint)
+        r = requests.post(request_endpoint, json=self.api_request)
         r.raise_for_status()
         assert r.status_code == requests.codes.ok
 
@@ -234,23 +243,21 @@ class Task:
         self.id = response['request_id']
         return self.id
 
-    def check_status(self, task_status_endpoint_url: str) -> Dict[str, Any]:
+    def check_status(self) -> Dict[str, Any]:
         """Fetch the .json content from the task URL
-
-        Args:
-            task_status_endpoint_url: str
 
         Returns: dict, contains fields ['Status', 'TaskId'] and possibly others
 
         Raises: requests.HTTPError, if an HTTP error occurred
         """
-        url = posixpath.join(task_status_endpoint_url, self.id)
+        url = posixpath.join(self.api_url, self.task_status_endpoint, self.id)
         r = requests.get(url)
 
         r.raise_for_status()
         assert r.status_code == requests.codes.ok
 
         self.response = r.json()
+        self.status = TaskStatus(self.response['Status']['request_status'])
         return self.response
 
     def get_missing_images(self, verbose: bool = False) -> List[str]:
@@ -261,14 +268,14 @@ class Task:
         "missing": an image from the submitted list that was not processed,
             for whatever reason
         "failed": a missing image explicitly marked as 'failed' by the
-            batch processing API
+            batch detection API
 
         Only run this method after check_status() returns a response where
         response['Status']['request_status'] == TaskStatus.COMPLETED.
 
         Returns: list of str, sorted list of missing image paths
         """
-        assert self.response['Status']['request_status'] == TaskStatus.COMPLETED
+        assert self.status == TaskStatus.COMPLETED
         message = self.response['Status']['message']
 
         # estimate # of failed images from failed shards
@@ -315,42 +322,50 @@ def divide_chunks(l: Sequence[Any], n: int) -> List[Sequence[Any]]:
     return chunks
 
 
-def divide_files_into_tasks(
-        file_list_json: str,
-        n_files_per_task: int = MAX_FILES_PER_API_TASK
-        ) -> Tuple[List[str], List[Sequence[Any]]]:
-    """
-    Divides the file *file_list_json*, which contains a single json-encoded list
-    of strings, into a set of json files, each containing *n_files_per_task*
-    (the last file will contain <= *n_files_per_task* files).
+def divide_list_into_tasks(file_list: Sequence[str],
+                           save_path: str,
+                           n_files_per_task: int = MAX_FILES_PER_API_TASK
+                           ) -> Tuple[List[str], List[Sequence[Any]]]:
+    """Divides a list of filenames into a set of JSON files, each containing a
+    list of length *n_files_per_task* (the last file will contain <=
+    *n_files_per_task* files).
 
-    Output JSON files have extension `*.chunkXXX.json`. For example, if the
-    input JSON file is `blah.json`, output files will be `blah.chunk000.json`,
-    `blah.chunk001.json`, etc.
+    Output JSON files are saved to *save_path* except the extension is replaced
+    with `*.chunkXXX.json`. For example, if *save_path* is `blah.json`, output
+    files will be `blah.chunk000.json`, `blah.chunk001.json`, etc.
 
     Args:
-        file_list_json: str, path to JSON file containing list of file names
+        file_list: list of str, filenames to split across multiple JSON files
+        save_path: str, base path to save the chunked lists
         n_files_per_task: int, max number of files to include in each API task
 
     Returns:
         output_files: list of str, output JSON file names
         chunks: list of list of str, chunks[i] is the content of output_files[i]
     """
-    with open(file_list_json) as f:
-        file_list = json.load(f)
-
     chunks = divide_chunks(file_list, n_files_per_task)
     output_files = []
 
     for i_chunk, chunk in enumerate(chunks):
         chunk_id = f'chunk{i_chunk:0>3d}'
         output_file = path_utils.insert_before_extension(
-            file_list_json, chunk_id)
+            save_path, chunk_id)
         output_files.append(output_file)
         with open(output_file, 'w') as f:
             json.dump(chunk, f, indent=1)
-
     return output_files, chunks
+
+
+def divide_files_into_tasks(file_list_json: str,
+                            n_files_per_task: int = MAX_FILES_PER_API_TASK
+                            ) -> Tuple[List[str], List[Sequence[Any]]]:
+    """Convenience wrapper around divide_list_into_tasks() when the file_list
+    itself is already saved as a JSON file.
+    """
+    with open(file_list_json) as f:
+        file_list = json.load(f)
+    return divide_list_into_tasks(file_list, save_path=file_list_json,
+                                  n_files_per_task=n_files_per_task)
 
 
 def clean_request_name(request_name: str,
