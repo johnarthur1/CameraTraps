@@ -64,6 +64,10 @@ class BatchAPISubmissionError(Exception):
     pass
 
 
+class BatchAPIResponseError(Exception):
+    pass
+
+
 class TaskStatus(str, Enum):
     RUNNING = 'running'
     FAILED = 'failed'
@@ -144,12 +148,9 @@ class Task:
                 if len(images_list) > MAX_FILES_PER_API_TASK:
                     raise ValueError('images list has too many files')
 
-                # If images_list contains URLs, strip away any query strings
-                # '?...'. This should have no adverse effect on local paths.
-                for img_path in images_list:
-                    stripped_img_path = urllib.parse.urlparse(img_path).path
-                    if not path_utils.is_image_file(stripped_img_path):
-                        raise ValueError(f'{img_path} is not an image')
+                for path_or_url in images_list:
+                    if not is_image_file_or_url(path_or_url):
+                        raise ValueError(f'{path_or_url} is not an image')
 
         if task_id is not None:
             self.id = task_id
@@ -164,6 +165,8 @@ class Task:
     def upload_images_list(self, account: str, container: str, sas_token: str,
                            blob_name: Optional[str] = None) -> None:
         """Uploads the local images list to an Azure Blob Storage container.
+
+        Sets self.remote_images_list_url to the blob URL of the uploaded file.
 
         Args:
             account: str, Azure Storage account name
@@ -188,7 +191,8 @@ class Task:
                              ) -> Dict[str, Any]:
         """Generate API request JSON.
 
-        For complete list of API input parameters, see:
+        Sets self.api_request to the request JSON. For complete list of API
+        input parameters, see:
         https://github.com/microsoft/CameraTraps/tree/master/api/batch_processing#api-inputs
 
         Args:
@@ -210,7 +214,7 @@ class Task:
             'images_requested_json_sas': self.remote_images_list_url
         })
         if input_container_url is None:
-            request['use_url'] = True  # TODO: check how `use_url` is used
+            request['use_url'] = True
         else:
             request['input_container_sas'] = input_container_url
         if image_path_prefix is not None:
@@ -221,7 +225,8 @@ class Task:
     def submit(self) -> str:
         """Submit this task to the Batch Detection API.
 
-        Only run this method after generate_api_request().
+        Sets self.id to the returned request ID. Only run this method after
+        generate_api_request().
 
         Returns: str, task ID
 
@@ -244,7 +249,9 @@ class Task:
         return self.id
 
     def check_status(self) -> Dict[str, Any]:
-        """Fetch the .json content from the task URL
+        """Checks the task status.
+
+        Sets self.response and self.status.
 
         Returns: dict, contains fields ['Status', 'TaskId'] and possibly others
 
@@ -270,8 +277,7 @@ class Task:
         "failed": a missing image explicitly marked as 'failed' by the
             batch detection API
 
-        Only run this method after check_status() returns a response where
-        response['Status']['request_status'] == TaskStatus.COMPLETED.
+        Only run this method when task.status == TaskStatus.COMPLETED.
 
         Returns: list of str, sorted list of missing image paths
         """
@@ -284,12 +290,16 @@ class Task:
 
         # Download all three JSON urls to memory
         output_file_urls = message['output_file_urls']
+        for url in output_file_urls.values():
+            if self.id not in url:
+                raise BatchAPIResponseError(
+                    f'Task ID missing from output URL: {url}')
         submitted_images = requests.get(output_file_urls['images']).json()
         detections = requests.get(output_file_urls['detections']).json()
         failed_images = requests.get(output_file_urls['failed_images']).json()
 
-        assert all(path_utils.find_image_strings(s) for s in submitted_images)
-        assert all(path_utils.find_image_strings(s) for s in failed_images)
+        assert all(is_image_file_or_url(s) for s in submitted_images)
+        assert all(is_image_file_or_url(s) for s in failed_images)
 
         # Diff submitted and processed images
         processed_images = [d['file'] for d in detections['images']]
@@ -382,6 +392,16 @@ def download_url(url: str, save_path: str, verbose: bool = False) -> None:
         print(f'Downloading {url} to {save_path}')
     urllib.request.urlretrieve(url, save_path)
     assert os.path.isfile(save_path)
+
+
+def is_image_file_or_url(path_or_url: str) -> bool:
+    """Checks (via file extension) whether a file path or URL is an image.
+
+    If path_or_url is a URL, strip away any query strings '?...'. This should
+    have no adverse effect on local paths.
+    """
+    stripped_path_or_url = urllib.parse.urlparse(path_or_url).path
+    return path_utils.is_image_file(stripped_path_or_url)
 
 
 #%% Interactive driver

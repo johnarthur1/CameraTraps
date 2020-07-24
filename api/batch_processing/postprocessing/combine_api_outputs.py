@@ -62,9 +62,10 @@ def combine_api_output_dictionaries(input_dicts: Iterable[Mapping[str, Any]],
     Args:
         input_dicts: list of dicts, each dict is the JSON of the detections
             output file from the Batch Processing API
-        require_uniqueness: bool, TODO
+        require_uniqueness: bool, whether to require that the images in
+            each input_dict be unique
 
-    Returns: TODO
+    Returns: dict, represents the merged JSON
     """
     # Map image filenames to detections, we'll convert to a list later
     images = {}
