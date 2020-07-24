@@ -70,6 +70,7 @@ organized as
     as the value for --detector-output-cache-dir.
 """
 import argparse
+from concurrent import futures
 from datetime import datetime
 import io
 import json
@@ -78,7 +79,7 @@ import time
 from typing import (
     Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple)
 
-from azure.storage.blob import ContainerClient
+from azure.storage.blob import download_blob_from_url
 from PIL import Image
 import requests
 from tqdm import tqdm
@@ -132,38 +133,44 @@ def main(json_images_path: str,
         potential_images_to_detect=[k for k in js if 'bbox' not in js[k]],
         detector_output_cache_dir=detector_output_cache_dir)
 
-    if local_detector:
-        # download the necessary images locally
-        # run_detection(images_to_detect, detector_version)
-        # call run_tf_detector_batch()
-        raise NotImplementedError
+    if len(images_to_detect) > 0:
 
-    else:
-        assert resume_file_path is not None
-        if os.path.exists(resume_file_path):
-            tasks_by_dataset = resume_tasks(
-                resume_file_path,
-                batch_detection_api_url=os.environ['BATCH_DETECTION_API_URL'])
+        if local_detector:
+            # download the necessary images locally
+            # run_detection(images_to_detect, detector_version)
+            # call run_tf_detector_batch()
+            raise NotImplementedError
+
         else:
-            tasks_by_dataset = submit_batch_detection_api(
-                images_to_detect=images_to_detect,
-                task_lists_dir=os.path.dirname(json_images_path),
-                detector_version=detector_version,
-                account=os.environ['CLASSIFICATION_BLOB_STORAGE_ACCOUNT'],
-                container=os.environ['CLASSIFICATION_BLOB_CONTAINER'],
-                sas_token=os.environ['CLASSIFICATION_BLOB_CONTAINER_WRITE_SAS'],
-                caller=os.environ['DETECTION_API_CALLER'],
-                batch_detection_api_url=os.environ['BATCH_DETECTION_API_URL'],
-                resume_file_path=resume_file_path)
-        wait_for_tasks(tasks_by_dataset, detector_output_cache_dir)
+            assert resume_file_path is not None
+            account = os.environ['CLASSIFICATION_BLOB_STORAGE_ACCOUNT']
+            container = os.environ['CLASSIFICATION_BLOB_CONTAINER']
+            sas_token = os.environ['CLASSIFICATION_BLOB_CONTAINER_WRITE_SAS']
+            caller = os.environ['DETECTION_API_CALLER']
+            batch_detection_api_url = os.environ['BATCH_DETECTION_API_URL']
 
-    # verify that there are no more images left to detect
-    images_to_detect = filter_detected_images(
-        potential_images_to_detect=[k for k in js if 'bbox' not in js[k]],
-        detector_output_cache_dir=detector_output_cache_dir)
-    assert len(images_to_detect) == 0
+            if os.path.exists(resume_file_path):
+                tasks_by_dataset = resume_tasks(
+                    resume_file_path,
+                    batch_detection_api_url=batch_detection_api_url)
+            else:
+                tasks_by_dataset = submit_batch_detection_api(
+                    images_to_detect=images_to_detect,
+                    task_lists_dir=os.path.dirname(json_images_path),
+                    detector_version=detector_version,
+                    account=account, container=container, sas_token=sas_token,
+                    caller=caller,
+                    batch_detection_api_url=batch_detection_api_url,
+                    resume_file_path=resume_file_path)
+            wait_for_tasks(tasks_by_dataset, detector_output_cache_dir)
 
-    download_and_crop(
+        # verify that there are no more images left to detect
+        images_to_detect = filter_detected_images(
+            potential_images_to_detect=[k for k in js if 'bbox' not in js[k]],
+            detector_output_cache_dir=detector_output_cache_dir)
+        assert len(images_to_detect) == 0
+
+    images_missing_detections, images_failed_download = download_and_crop(
         json_images=js,
         detector_output_cache_dir=detector_output_cache_dir,
         detector_version=detector_version,
@@ -171,6 +178,8 @@ def main(json_images_path: str,
         confidence_threshold=confidence_threshold,
         images_dir=images_dir,
         threads=threads)
+    print('Images with missing detections:', images_missing_detections)
+    print('Images that failed to download:', images_failed_download)
 
 
 def load_detection_cache(detector_output_cache_dir: str,
@@ -475,6 +484,7 @@ def wait_for_tasks(tasks_by_dataset: Mapping[str, Iterable[Task]],
                               f'{num_failed_shards} failed shards.')
 
             detections_url = message['output_file_urls']['detections']
+            assert task.id in detections_url
             detections = requests.get(detections_url).json()
             msg = cache_detections(
                 detections=detections, dataset=dataset,
@@ -564,9 +574,7 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
     megadb = MegadbUtils()
     datasets_table = megadb.get_datasets_table()
 
-    # container_clients: (account, container_name) => ContainerClient
     # detection_cache_by_dataset: dataset => {img_path => detection_dict}
-    container_clients: Dict[Tuple[str, str], ContainerClient] = {}
     detection_cache_by_dataset: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     images_missing_detections = []
@@ -581,6 +589,10 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
                             '{img_file_root}_mdv{v}_crop{n:>02d}.jpg')
     }
 
+    pool = futures.ThreadPoolExecutor(max_workers=threads)
+    future_to_img_file = {}
+
+    print('Getting bbox info for each image...')
     for img_file, info_dict in tqdm(json_images.items()):
         ds, blob_name = img_file.split('/', maxsplit=1)
         assert ds == info_dict['dataset']
@@ -604,46 +616,73 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
         # check if crops are already downloaded, and ignore bboxes below the
         # confidence threshold
         # crop_path => bbox_dict
-        bbox_dicts_tocrop: Dict[str, Dict[str, Any]] = {}
+        bboxes_tocrop: Dict[str, Dict[str, Any]] = {}
         for i, bbox_dict in enumerate(bbox_dicts):
-            if bbox_dict['conf'] < confidence_threshold:
+            if 'conf' in bbox_dict and bbox_dict['conf'] < confidence_threshold:
                 continue
             img_file_root = os.path.splitext(img_file)[0]
             crop_path = crop_path_template[is_bbox_ground_truth].format(
                 img_file_root=img_file_root, v=detector_version, n=i)
             if not os.path.exists(crop_path):
-                bbox_dicts_tocrop[crop_path] = bbox_dict
-        if len(bbox_dicts_tocrop) == 0:
+                bboxes_tocrop[crop_path] = bbox_dict['bbox']
+        if len(bboxes_tocrop) == 0:
             continue
 
         # get the image, either from disk or from Blob Storage
-        # TODO: use try/except
-        img = None
-        if images_dir is not None:
-            img_path = os.path.join(images_dir, img_file)
-            if os.path.exists(img_path):
-                with Image.open(img_path) as img:
-                    img.load()
-        if img is None:
-            # download image from Blob Storage
-            account = datasets_table[ds]['storage_account']
-            container = datasets_table[ds]['container']
+        future = pool.submit(load_and_crop, images_dir, img_file,
+                             datasets_table[ds], bboxes_tocrop)
+        future_to_img_file[future] = img_file
 
-            if (account, container) not in container_clients:
-                container_clients[(account, container)] = ContainerClient(
-                    account_url=sas_blob_utils.build_azure_storage_uri(account),
-                    container_name=container,
-                    credential=datasets_table[ds]['container_sas_key'])
-            container_client = container_clients[(account, container)]
-            with io.BytesIO() as stream:
-                container_client.download_blob().readinto(stream)
-                stream.seek(0)
-                with Image.open(stream) as img:
-                    img.load()
+    print('Loading/downloading images and cropping...')
+    n_futures = len(future_to_img_file)
+    for future in tqdm(futures.as_completed(future_to_img_file), len=n_futures):
+        img_file = future_to_img_file[future]
+        try:
+            future.result()
+        except Exception as e:  # pylint: disable=broad-except
+            tqdm.write(f'{img_file} - generated an exception: {e}')
+            images_failed_download.append(img_file)
+        else:
+            tqdm.write(f'{img_file} - successfully loaded and cropped')
 
-        # crop the image
-        for crop_path, bbox_dict in bbox_dicts_tocrop.items():
-            save_crop(img, bbox_norm=bbox_dict['bbox'], save=crop_path)
+    pool.shutdown()
+    return images_missing_detections, images_failed_download
+
+
+def load_and_crop(images_dir: Optional[str], img_file: str,
+                  dataset_info: Mapping[str, Any],
+                  bboxes_tocrop: Mapping[str, Sequence[float]]):
+    """Loads an image from disk or Azure Blob Storage, then crops it.
+
+    Args:
+        images_dir: optional str, path to local directory of images
+        img_file: str, image file path with format `<dataset-name>/<blob-name>`
+        dataset_info: dict, info about dataset from MegaDB
+        bboxes_tocrop: dict, maps crop file name to [xmin, ymin, width, height]
+            all in normalized coordinates
+    """
+    img = None
+    if images_dir is not None:
+        img_path = os.path.join(images_dir, img_file)
+        if os.path.exists(img_path):
+            with Image.open(img_path) as img:
+                img.load()
+    if img is None:
+        # download image from Blob Storage
+        blob_url = sas_blob_utils.build_azure_storage_uri(
+            account=dataset_info['storage_account'],
+            container=dataset_info['container'],
+            blob=img_file[img_file.find('/') + 1:])
+        credential = dataset_info['container_sas_key']
+        with io.BytesIO() as stream:
+            download_blob_from_url(blob_url, stream, credential=credential)
+            stream.seek(0)
+            with Image.open(stream) as img:
+                img.load()
+
+    # crop the image
+    for crop_path, bbox in bboxes_tocrop.items():
+        save_crop(img, bbox_norm=bbox, save=crop_path)
 
 
 def save_crop(img: Image.Image, bbox_norm: Sequence[float], save: str) -> None:
@@ -654,6 +693,7 @@ def save_crop(img: Image.Image, bbox_norm: Sequence[float], save: str) -> None:
             normalized coordinates
         save: str, path to save cropped image
     """
+    os.makedirs(os.path.abspath(os.path.dirname(save)), exist_ok=True)
     img_width, img_height = img.size
     img.crop(box=[
         bbox_norm[0] * img_width,                    # left
@@ -702,25 +742,26 @@ def _parse_args() -> argparse.Namespace:
 
 
 if __name__ == '__main__':
-    args = _parse_args()
-    assert 0 <= args.confidence_threshold <= 1
-    main(json_images_path=args.json_images,
-         detector_version=args.detector_version,
-         detector_output_cache_base_dir=args.detector_output_cache_dir,
-         cropped_images_dir=args.cropped_images_dir,
-         confidence_threshold=args.confidence_threshold,
-         local_detector=args.local_detector,
-         images_dir=args.images_dir,
-         threads=args.threads,
-         resume_file_path=args.resume_file)
+    # args = _parse_args()
+    # assert 0 <= args.confidence_threshold <= 1
+    # main(json_images_path=args.json_images,
+    #      detector_version=args.detector_version,
+    #      detector_output_cache_base_dir=args.detector_output_cache_dir,
+    #      cropped_images_dir=args.cropped_images_dir,
+    #      confidence_threshold=args.confidence_threshold,
+    #      local_detector=args.local_detector,
+    #      images_dir=args.images_dir,
+    #      threads=args.threads,
+    #      resume_file_path=args.resume_file)
 
-    # main(
-    #     json_images_path='run_small/json_images.json',
-    #     detector_version='4.1',
-    #     detector_output_cache_base_dir='mdcache/',
-    #     cropped_images_dir='run_small/cropped_images',
-    #     confidence_threshold=0.8,
-    #     local_detector=False,
-    #     images_dir=None,
-    #     threads=1,
-    #     resume_file_path='run_small/resume_detections.json')
+    basedir = '/home/cyeh/CameraTraps/classification/'
+    main(
+        json_images_path=basedir + 'run_small/json_images.json',
+        detector_version='4.1',
+        detector_output_cache_base_dir=basedir + 'mdcache/',
+        cropped_images_dir=basedir + 'run_small/cropped_images',
+        confidence_threshold=0.8,
+        local_detector=False,
+        images_dir=None,
+        threads=30,
+        resume_file_path=basedir + 'run_small/resume_detections2.json')
