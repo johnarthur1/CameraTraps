@@ -97,8 +97,8 @@ def main(json_images_path: str,
          detector_version: str,
          detector_output_cache_base_dir: str,
          cropped_images_dir: str,
+         detector: str,
          confidence_threshold: float = 0,
-         local_detector: bool = False,
          images_dir: Optional[str] = None,
          threads: int = 1,
          resume_file_path: Optional[str] = None) -> None:
@@ -113,15 +113,19 @@ def main(json_images_path: str,
             where detector outputs are cached, 1 JSON file per dataset
         cropped_images_dir: str, path to local directory for saving crops of
             bounding boxes
+        detector: str, one of ['local', 'batchapi', 'skip'],
+            whether to run detection locally or through the Batch Detection API,
+            or to skip running the detector entirely
         confidence_threshold: float, only crop bounding boxes above this value
-        local_detector: bool, whether to run detection locally or through
-            the Batch Detection API
+        skip_detection: bool, whether to skip running the detector
         images_dir: optional str, path to local directory where images are saved
         threads: int, number of threads to use for downloading images
         resume_file_path: optional str, path to save JSON file with list of info
             dicts on running tasks, or to resume from running tasks, only used
-            if local_detector is False
+            if detector=='batchapi'
     """
+    assert detector in ['local', 'batchapi', 'skip']
+
     with open(json_images_path, 'r') as f:
         js = json.load(f)
     detector_output_cache_dir = os.path.join(
@@ -133,9 +137,9 @@ def main(json_images_path: str,
         potential_images_to_detect=[k for k in js if 'bbox' not in js[k]],
         detector_output_cache_dir=detector_output_cache_dir)
 
-    if len(images_to_detect) > 0:
+    if detector != 'skip' and len(images_to_detect) > 0:
 
-        if local_detector:
+        if detector == 'local':
             # download the necessary images locally
             # run_detection(images_to_detect, detector_version)
             # call run_tf_detector_batch()
@@ -592,7 +596,7 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
     pool = futures.ThreadPoolExecutor(max_workers=threads)
     future_to_img_file = {}
 
-    print('Getting bbox info for each image...')
+    print(f'Getting bbox info for {len(json_images)} images...')
     for img_file, info_dict in tqdm(json_images.items()):
         ds, blob_name = img_file.split('/', maxsplit=1)
         assert ds == info_dict['dataset']
@@ -633,8 +637,8 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
                              datasets_table[ds], bboxes_tocrop)
         future_to_img_file[future] = img_file
 
-    print('Loading/downloading images and cropping...')
     n_futures = len(future_to_img_file)
+    print(f'Loading/downloading {n_futures} images and cropping...')
     for future in tqdm(futures.as_completed(future_to_img_file), len=n_futures):
         img_file = future_to_img_file[future]
         try:
@@ -686,7 +690,8 @@ def load_and_crop(images_dir: Optional[str], img_file: str,
 
 
 def save_crop(img: Image.Image, bbox_norm: Sequence[float], save: str) -> None:
-    """
+    """Crops an image and saves the crop to file.
+
     Args:
         img: PIL.Image.Image object, already loaded
         bbox_norm: list or tuple of float, [xmin, ymin, width, height] all in
@@ -720,8 +725,13 @@ def _parse_args() -> argparse.Namespace:
         '-v', '--detector-version', required=True,
         help='detector version string, e.g., "4.1"')
     parser.add_argument(
-        '--local-detector', action='store_true',
-        help='run detector locally instead of calling the batch API')
+        '--detector', choices=['local', 'batchapi', 'skip'],
+        help='whether to run the detector locally, via the Batch API, or to '
+             'skip running the detector entirely (and only use ground truth '
+             'and cached bounding boxes.')
+    parser.add_argument(
+        '-t', '--confidence-threshold', type=float,
+        help='confidence threshold above which to crop bounding boxes')
     parser.add_argument(
         '-i', '--images-dir', default=None,
         help='path to local directory where images are saved')
@@ -735,33 +745,30 @@ def _parse_args() -> argparse.Namespace:
              'flag is not set. Each dict has keys '
              '["dataset", "task_id", "task_name", "local_images_list_path", '
              '"remote_images_list_url"]')
-    parser.add_argument(
-        '-t', '--confidence-threshold', type=float,
-        help='confidence threshold above which to crop bounding boxes')
     return parser.parse_args()
 
 
 if __name__ == '__main__':
-    # args = _parse_args()
-    # assert 0 <= args.confidence_threshold <= 1
-    # main(json_images_path=args.json_images,
-    #      detector_version=args.detector_version,
-    #      detector_output_cache_base_dir=args.detector_output_cache_dir,
-    #      cropped_images_dir=args.cropped_images_dir,
-    #      confidence_threshold=args.confidence_threshold,
-    #      local_detector=args.local_detector,
-    #      images_dir=args.images_dir,
-    #      threads=args.threads,
-    #      resume_file_path=args.resume_file)
+    args = _parse_args()
+    assert 0 <= args.confidence_threshold <= 1
+    main(json_images_path=args.json_images,
+         detector_version=args.detector_version,
+         detector_output_cache_base_dir=args.detector_output_cache_dir,
+         cropped_images_dir=args.cropped_images_dir,
+         detector=args.detector,
+         confidence_threshold=args.confidence_threshold,
+         images_dir=args.images_dir,
+         threads=args.threads,
+         resume_file_path=args.resume_file)
 
-    basedir = '/home/cyeh/CameraTraps/classification/'
-    main(
-        json_images_path=basedir + 'run_small/json_images.json',
-        detector_version='4.1',
-        detector_output_cache_base_dir=basedir + 'mdcache/',
-        cropped_images_dir=basedir + 'run_small/cropped_images',
-        confidence_threshold=0.8,
-        local_detector=False,
-        images_dir=None,
-        threads=30,
-        resume_file_path=basedir + 'run_small/resume_detections2.json')
+    # basedir = '/home/cyeh/CameraTraps/classification/'
+    # main(
+    #     json_images_path=basedir + 'run_small/json_images.json',
+    #     detector_version='4.1',
+    #     detector_output_cache_base_dir=basedir + 'mdcache/',
+    #     cropped_images_dir=basedir + 'run_small/cropped_images',
+    #     confidence_threshold=0.8,
+    #     detector='batchapi',
+    #     images_dir=None,
+    #     threads=30,
+    #     resume_file_path=basedir + 'run_small/resume_detections2.json')
