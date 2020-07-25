@@ -619,8 +619,7 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
 
         # check if crops are already downloaded, and ignore bboxes below the
         # confidence threshold
-        # crop_path => bbox_dict
-        bboxes_tocrop: Dict[str, Dict[str, Any]] = {}
+        bboxes_tocrop: Dict[str, Dict[str, Any]] = {}  # crop_path => bbox
         for i, bbox_dict in enumerate(bbox_dicts):
             if 'conf' in bbox_dict and bbox_dict['conf'] < confidence_threshold:
                 continue
@@ -638,8 +637,9 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
         future_to_img_file[future] = img_file
 
     n_futures = len(future_to_img_file)
-    print(f'Loading/downloading {n_futures} images and cropping...')
-    for future in tqdm(futures.as_completed(future_to_img_file), len=n_futures):
+    print(f'Reading/downloading {n_futures} images and cropping...')
+    for future in tqdm(futures.as_completed(future_to_img_file),
+                       total=n_futures):
         img_file = future_to_img_file[future]
         try:
             future.result()
