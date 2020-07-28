@@ -14,23 +14,24 @@ dependencies:
 # - cudatoolkit=10.2  # for GPU
 
 # from defaults channel
-- pandas
-- nb_conda_kernels
 - humanfriendly
-- jupyterlab
 - jsonpickle    # used by run_tf_detector_batch.py
+- jupyterlab
 - matplotlib
 - mypy
-- pillow
-- pylint
+- nb_conda_kernels
 - numpy
 - openpyxl      # used by taxonomy_mapping/species_by_dataset.py
+- pandas
+- pillow
 - progressbar2  # used by ai4eutils (which is called by taxonomy-mapping code)
-- tqdm
+- pylint
 - scikit-learn
+- seaborn
 - tensorboard
-- pip
+- tqdm
 - xlrd          # for pandas Excel support, needed by taxonomy_mapping/process_species_by_dataset
+- pip
 
 # Some Azure packages or versions are only available from PyPI
 # These may require GCC to be installed
