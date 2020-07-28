@@ -13,7 +13,7 @@ that the dataset name does not contain '/'.
         "location": 13,
         "class": "mountain_lion",  # class from dataset
         "bbox": [{"category": "animal",
-                  "bbox": [0, 0.347, 0.237, 0.257]}],
+                  "bbox": [0, 0.347, 0.237, 0.257]}],   # ground-truth bbox
         "label": ["monutain_lion"]  # labels to use in classifier
     },
     "caltech/cct_images/59f5fe2b-23d2-11e8-a6a3-ec086b02610b.jpg": {
@@ -75,6 +75,7 @@ from datetime import datetime
 import io
 import json
 import os
+import pprint
 import time
 from typing import (
     Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple)
@@ -88,7 +89,7 @@ from api.batch_processing.data_preparation.prepare_api_submission import (
     Task, TaskStatus, divide_list_into_tasks)
 from api.batch_processing.postprocessing.combine_api_outputs import (
     combine_api_output_dictionaries)
-from data_management.megadb.megadb_utils import MegadbUtils
+from data_management.megadb import megadb_utils
 # from detection import run_tf_detector_batch
 import sas_blob_utils  # from ai4eutils
 
@@ -133,7 +134,7 @@ def main(json_images_path: str,
     if not os.path.exists(detector_output_cache_dir):
         os.makedirs(detector_output_cache_dir)
         print(f'Created directory at {detector_output_cache_dir}')
-    images_to_detect = filter_detected_images(
+    images_to_detect, detection_cache = filter_detected_images(
         potential_images_to_detect=[k for k in js if 'bbox' not in js[k]],
         detector_output_cache_dir=detector_output_cache_dir)
 
@@ -168,22 +169,24 @@ def main(json_images_path: str,
                     resume_file_path=resume_file_path)
             wait_for_tasks(tasks_by_dataset, detector_output_cache_dir)
 
-        # verify that there are no more images left to detect
-        images_to_detect = filter_detected_images(
+        # verify there are no more images to detect, and refresh detection cache
+        images_to_detect, detection_cache = filter_detected_images(
             potential_images_to_detect=[k for k in js if 'bbox' not in js[k]],
             detector_output_cache_dir=detector_output_cache_dir)
         assert len(images_to_detect) == 0
 
     images_missing_detections, images_failed_download = download_and_crop(
         json_images=js,
-        detector_output_cache_dir=detector_output_cache_dir,
+        detection_cache=detection_cache,
         detector_version=detector_version,
         cropped_images_dir=cropped_images_dir,
         confidence_threshold=confidence_threshold,
         images_dir=images_dir,
         threads=threads)
-    print('Images with missing detections:', images_missing_detections)
-    print('Images that failed to download:', images_failed_download)
+    print('Images with missing detections:')
+    pprint.pprint(images_missing_detections)
+    print('Images that failed to download:')
+    pprint.pprint(images_failed_download)
 
 
 def load_detection_cache(detector_output_cache_dir: str,
@@ -209,9 +212,10 @@ def load_detection_cache(detector_output_cache_dir: str,
     return dataset_cache
 
 
-def filter_detected_images(potential_images_to_detect: Iterable[str],
-                           detector_output_cache_dir: str
-                           ) -> List[str]:
+def filter_detected_images(
+        potential_images_to_detect: Iterable[str],
+        detector_output_cache_dir: str
+        ) -> Tuple[List[str], Dict[str, Dict[str, Dict[str, Any]]]]:
     """Checks image paths against cached Detector outputs, and prepares
     the SAS URIs for each image not in the cache.
 
@@ -224,24 +228,29 @@ def filter_detected_images(potential_images_to_detect: Iterable[str],
         cropp
             outputs are cached
 
-    Returns: list of str, paths to images not in the detector output cache,
-        with the format <dataset-name>/<img-filename>
+    Returns:
+        images_to_detect: list of str, paths to images not in the detector
+            output cache, with the format <dataset-name>/<img-filename>
+        detection_cache: dict, maps str dataset name to dict,
+            detection_cache[dataset_name] is the 'detections' list from the
+            Batch Detection API output
     """
     # cache of Detector outputs: dataset name => {img_path => detection_dict}
-    cache: Dict[str, Dict[str, Dict]] = {}
+    detection_cache: Dict[str, Dict[str, Dict]] = {}
 
     images_to_detect = []
     for img_path in potential_images_to_detect:
         # img_path: <dataset-name>/<img-filename>
         ds, img_file = img_path.split('/', maxsplit=1)
 
-        if ds not in cache:
-            cache[ds] = load_detection_cache(detector_output_cache_dir, ds)
+        if ds not in detection_cache:
+            detection_cache[ds] = load_detection_cache(
+                detector_output_cache_dir, ds)
 
-        if img_file not in cache[ds]:
+        if img_file not in detection_cache[ds]:
             images_to_detect.append(img_path)
 
-    return images_to_detect
+    return images_to_detect, detection_cache
 
 
 def get_image_sas_uris(local_images: Iterable[str]) -> List[str]:
@@ -256,8 +265,7 @@ def get_image_sas_uris(local_images: Iterable[str]) -> List[str]:
             pass to the batch detection API
     """
     # we need the datasets table for getting SAS keys
-    megadb = MegadbUtils()
-    datasets_table = megadb.get_datasets_table()
+    datasets_table = megadb_utils.MegadbUtils().get_datasets_table()
 
     image_sas_uris = []
     for img_path in local_images:
@@ -323,8 +331,7 @@ def submit_batch_detection_api(images_to_detect: Iterable[str],
 
     Returns: dict, maps str dataset name to list of Task objects
     """
-    megadb = MegadbUtils()
-    datasets_table = megadb.get_datasets_table()
+    datasets_table = megadb_utils.MegadbUtils().get_datasets_table()
 
     images_by_dataset = split_images_list_by_dataset(images_to_detect)
     tasks_by_dataset = {}
@@ -339,11 +346,11 @@ def submit_batch_detection_api(images_to_detect: Iterable[str],
             sas_token=images_sas_token)
 
         # strip image paths of dataset name
-        image_paths = [path.split('/', maxsplit=1)[1] for path in image_paths]
+        image_blob_names = [path[path.find('/') + 1:] for path in image_paths]
 
         tasks_by_dataset[dataset] = submit_batch_detection_api_by_dataset(
             dataset=dataset,
-            image_paths=image_paths,
+            image_blob_names=image_blob_names,
             images_container_url=images_container_url,
             task_lists_dir=task_lists_dir,
             detector_version=detector_version,
@@ -368,7 +375,7 @@ def submit_batch_detection_api(images_to_detect: Iterable[str],
 
 def submit_batch_detection_api_by_dataset(
         dataset: str,
-        image_paths: Sequence[str],
+        image_blob_names: Sequence[str],
         images_container_url: str,
         task_lists_dir: str,
         detector_version: str,
@@ -381,10 +388,10 @@ def submit_batch_detection_api_by_dataset(
     """
     Args:
         dataset: str, name of dataset
-        image_paths: list of str, image paths all from the same dataset
+        image_blob_names: list of str, image blob names from the same dataset
         images_container_url: str, URL to blob storage container where images
-            are stored, including SAS token with read permissions if container
-            is not public
+            from this dataset are stored, including SAS token with read
+            permissions if container is not public
         **see submit_batch_detection_api() for description of other args
 
     Returns: list of Task objects
@@ -395,7 +402,7 @@ def submit_batch_detection_api_by_dataset(
     task_list_base_filename = f'task_list_{dataset}_{date}.json'
 
     task_list_paths, _ = divide_list_into_tasks(
-        file_list=image_paths,
+        file_list=image_blob_names,
         save_path=os.path.join(task_lists_dir, task_list_base_filename))
 
     # complete task name: 'detect_for_classifier_caltech_20200722_110816_task01'
@@ -540,14 +547,15 @@ def cache_detections(detections: Mapping[str, Any],
     return msg
 
 
-def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
-                      detector_output_cache_dir: str,
-                      detector_version: str,
-                      cropped_images_dir: str,
-                      confidence_threshold: float,
-                      images_dir: Optional[str] = None,
-                      threads: int = 1
-                      ) -> Tuple[List[str], List[str]]:
+def download_and_crop(
+        json_images: Mapping[str, Mapping[str, Any]],
+        detection_cache: Mapping[str, Mapping[str, Mapping[str, Any]]],
+        detector_version: str,
+        cropped_images_dir: str,
+        confidence_threshold: float,
+        images_dir: Optional[str] = None,
+        threads: int = 1
+        ) -> Tuple[List[str], List[str]]:
     """
 
     Saves crops to a file with the same name as the original image, except the
@@ -560,8 +568,7 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
 
     Args:
         json_images: dict, represents JSON output of json_validator.py
-        detector_output_cache_dir: str, path to folder where detector
-            outputs are cached, stored as 1 JSON file per dataset
+        detection_cache: dict, dataset_name => {img_path => detection_dict}
         detector_version: str, detector version string, e.g., '4.1'
         cropped_images_dir: str, path to folder where cropped images are saved
         confidence_threshold: float, only crop bounding boxes above this value
@@ -575,11 +582,7 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
             failed to download
     """
     # we need the datasets table for getting SAS keys
-    megadb = MegadbUtils()
-    datasets_table = megadb.get_datasets_table()
-
-    # detection_cache_by_dataset: dataset => {img_path => detection_dict}
-    detection_cache_by_dataset: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    datasets_table = megadb_utils.MegadbUtils().get_datasets_table()
 
     images_missing_detections = []
     images_failed_download = []
@@ -588,95 +591,92 @@ def download_and_crop(json_images: Mapping[str, Mapping[str, Any]],
     # always save as JPG for consistency
     crop_path_template = {
         True: os.path.join(cropped_images_dir,
-                           '{img_file_root}_crop{n:>02d}.jpg'),
+                           '{img_path_root}_crop{n:>02d}.jpg'),
         False: os.path.join(cropped_images_dir,
-                            '{img_file_root}_mdv{v}_crop{n:>02d}.jpg')
+                            '{img_path_root}_mdv{v}_crop{n:>02d}.jpg')
     }
 
     pool = futures.ThreadPoolExecutor(max_workers=threads)
-    future_to_img_file = {}
+    future_to_img_path = {}
 
     print(f'Getting bbox info for {len(json_images)} images...')
-    for img_file, info_dict in tqdm(json_images.items()):
-        ds, blob_name = img_file.split('/', maxsplit=1)
+    for img_path, info_dict in tqdm(json_images.items()):
+        ds, img_file = img_path.split('/', maxsplit=1)
         assert ds == info_dict['dataset']
 
         # get bounding boxes
         if 'bbox' in info_dict:  # ground-truth bounding boxes
             bbox_dicts = info_dict['bbox']
-            is_bbox_ground_truth = True
+            is_ground_truth = True
         else:  # get bounding boxes from detector cache
-            if ds not in detection_cache_by_dataset:
-                detection_cache_by_dataset[ds] = load_detection_cache(
-                    detector_output_cache_dir, ds)
-            detection_cache = detection_cache_by_dataset[ds]
-            if blob_name in detection_cache:
-                bbox_dicts = detection_cache[blob_name]['detections']
+            if img_file in detection_cache[ds]:
+                bbox_dicts = detection_cache[ds][img_file]['detections']
             else:
-                images_missing_detections.append(img_file)
+                images_missing_detections.append(img_path)
                 continue
-            is_bbox_ground_truth = False
+            is_ground_truth = False
 
         # check if crops are already downloaded, and ignore bboxes below the
         # confidence threshold
         bboxes_tocrop: Dict[str, Dict[str, Any]] = {}  # crop_path => bbox
         for i, bbox_dict in enumerate(bbox_dicts):
-            if 'conf' in bbox_dict and bbox_dict['conf'] < confidence_threshold:
+            # ground-truth bboxes do not have a "confidence" value
+            if not is_ground_truth and bbox_dict['conf'] < confidence_threshold:
                 continue
-            img_file_root = os.path.splitext(img_file)[0]
-            crop_path = crop_path_template[is_bbox_ground_truth].format(
-                img_file_root=img_file_root, v=detector_version, n=i)
+            img_path_root = os.path.splitext(img_path)[0]
+            crop_path = crop_path_template[is_ground_truth].format(
+                img_path_root=img_path_root, v=detector_version, n=i)
             if not os.path.exists(crop_path):
                 bboxes_tocrop[crop_path] = bbox_dict['bbox']
         if len(bboxes_tocrop) == 0:
             continue
 
         # get the image, either from disk or from Blob Storage
-        future = pool.submit(load_and_crop, images_dir, img_file,
+        future = pool.submit(load_and_crop, images_dir, img_path,
                              datasets_table[ds], bboxes_tocrop)
-        future_to_img_file[future] = img_file
+        future_to_img_path[future] = img_path
 
-    n_futures = len(future_to_img_file)
+    n_futures = len(future_to_img_path)
     print(f'Reading/downloading {n_futures} images and cropping...')
-    for future in tqdm(futures.as_completed(future_to_img_file),
+    for future in tqdm(futures.as_completed(future_to_img_path),
                        total=n_futures):
-        img_file = future_to_img_file[future]
+        img_path = future_to_img_path[future]
         try:
             future.result()
         except Exception as e:  # pylint: disable=broad-except
-            tqdm.write(f'{img_file} - generated an exception: {e}')
-            images_failed_download.append(img_file)
+            tqdm.write(f'{img_path} - generated an exception: {e}')
+            images_failed_download.append(img_path)
         else:
-            tqdm.write(f'{img_file} - successfully loaded and cropped')
+            tqdm.write(f'{img_path} - successfully loaded and cropped')
 
     pool.shutdown()
     return images_missing_detections, images_failed_download
 
 
-def load_and_crop(images_dir: Optional[str], img_file: str,
+def load_and_crop(images_dir: Optional[str], img_path: str,
                   dataset_info: Mapping[str, Any],
                   bboxes_tocrop: Mapping[str, Sequence[float]]):
     """Loads an image from disk or Azure Blob Storage, then crops it.
 
     Args:
         images_dir: optional str, path to local directory of images
-        img_file: str, image file path with format `<dataset-name>/<blob-name>`
+        img_path: str, image path with format `<dataset-name>/<blob-name>`
         dataset_info: dict, info about dataset from MegaDB
         bboxes_tocrop: dict, maps crop file name to [xmin, ymin, width, height]
             all in normalized coordinates
     """
     img = None
     if images_dir is not None:
-        img_path = os.path.join(images_dir, img_file)
-        if os.path.exists(img_path):
-            with Image.open(img_path) as img:
+        full_img_path = os.path.join(images_dir, img_path)
+        if os.path.exists(full_img_path):
+            with Image.open(full_img_path) as img:
                 img.load()
     if img is None:
         # download image from Blob Storage
         blob_url = sas_blob_utils.build_azure_storage_uri(
             account=dataset_info['storage_account'],
             container=dataset_info['container'],
-            blob=img_file[img_file.find('/') + 1:])
+            blob=img_path[img_path.find('/') + 1:])
         credential = dataset_info['container_sas_key']
         with io.BytesIO() as stream:
             download_blob_from_url(blob_url, stream, credential=credential)
@@ -730,7 +730,7 @@ def _parse_args() -> argparse.Namespace:
              'skip running the detector entirely (and only use ground truth '
              'and cached bounding boxes.')
     parser.add_argument(
-        '-t', '--confidence-threshold', type=float,
+        '-t', '--confidence-threshold', type=float, default=0.0,
         help='confidence threshold above which to crop bounding boxes')
     parser.add_argument(
         '-i', '--images-dir', default=None,
