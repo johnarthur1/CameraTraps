@@ -121,10 +121,16 @@ def create_crops_csv(json_images_path: str,
     """
     with open(json_images_path, 'r') as f:
         js = json.load(f)
+
     detector_output_cache_dir = os.path.join(
         detector_output_cache_base_dir, f'v{detector_version}')
     detection_cache = {}
     datasets = set(img_path[:img_path.find('/')] for img_path in js)
+    print('loading detection cache...', end='')
+    for ds in datasets:
+        detection_cache[ds] = detect_and_crop.load_detection_cache(
+            detector_output_cache_dir=detector_output_cache_dir, dataset=ds)
+    print('done!')
 
     missing_detections = []  # no cached detections or ground truth bboxes
     images_no_confident_detections = []  # cached detections contain 0 bboxes
@@ -137,12 +143,6 @@ def create_crops_csv(json_images_path: str,
         True: '{img_path_root}_crop{n:>02d}.jpg',
         False: '{img_path_root}_mdv{v}_crop{n:>02d}.jpg'
     }
-
-    print('loading detection cache...', end='')
-    for ds in datasets:
-        detection_cache[ds] = detect_and_crop.load_detection_cache(
-            detector_output_cache_dir=detector_output_cache_dir, dataset=ds)
-    print('done!')
 
     for img_path, img_info in tqdm(js.items()):
         ds, img_file = img_path.split('/', maxsplit=1)
@@ -181,11 +181,13 @@ def create_crops_csv(json_images_path: str,
             continue
         all_rows.extend(rows)
 
+    print('Saving classification dataset CSV...', end='')
     df = pd.DataFrame(
         data=all_rows,
         columns=['path', 'dataset', 'location', 'dataset_class', 'confidence',
                  'label'])
     df.to_csv(csv_save_path, index=False)
+    print('done!')
 
     return (missing_detections,
             images_no_confident_detections,
@@ -222,7 +224,7 @@ def create_splits(df: pd.DataFrame) -> Dict[str, List[Tuple[str, str]]]:
 
     # sorted smallest to largest
     ordered_labels = df.groupby('label').size().sort_values()
-    for label, label_size in ordered_labels.items():
+    for label, label_size in tqdm(ordered_labels.items()):
 
         ordered_locs = (df[df['label'] == label]
                         .groupby('dataset_location')

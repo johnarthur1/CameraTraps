@@ -201,7 +201,7 @@ def load_detection_cache(detector_output_cache_dir: str,
             outputs are cached, stored as 1 JSON file per dataset
         dataset: str, name of dataset
 
-    Returns: dict, maps str image path to dict of detection info
+    Returns: dict, maps str image file to dict of detection info
     """
     cache_path = os.path.join(detector_output_cache_dir, f'{dataset}.json')
     dataset_cache = {}
