@@ -209,7 +209,7 @@ def main(classification_dataset_csv_path: str,
     writer = tensorboard.SummaryWriter(logdir)
 
     # create dataloaders and log the index_to_label mapping
-    dataloaders, idx_to_label = create_dataloaders(
+    loaders, idx_to_label = create_dataloaders(
         classification_dataset_csv_path=classification_dataset_csv_path,
         splits_json_path=splits_json_path,
         cropped_images_dir=cropped_images_dir,
@@ -263,6 +263,8 @@ def main(classification_dataset_csv_path: str,
         lr *= 0.97 ** (175 / 2.4)  # set lr to the halfway point
     optimizer = torch.optim.RMSprop(
         model.parameters(), lr, alpha=0.9, momentum=0.9, weight_decay=1e-5)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer=optimizer, step_size=1, gamma=0.97 ** (1 / 2.4))
 
     best_epoch_metrics: Dict[str, float] = {}
     for epoch in range(epochs):
@@ -270,19 +272,20 @@ def main(classification_dataset_csv_path: str,
 
         print('- train:')
         train_metrics = run_epoch(
-            model, loader=dataloaders['train'], device=device,
-            finetune=finetune, optimizer=optimizer, criterion=criterion)
+            model, loader=loaders['train'], device=device, criterion=criterion,
+            finetune=finetune, optimizer=optimizer)
         train_metrics = prefix_all_keys(train_metrics, prefix='train/')
         log_metrics(writer, train_metrics, epoch)
 
         print('- val:')
         val_metrics = run_epoch(
-            model, loader=dataloaders['val'], device=device,
-            criterion=criterion)
+            model, loader=loaders['val'], device=device, criterion=criterion)
         val_metrics = prefix_all_keys(val_metrics, prefix='val/')
         log_metrics(writer, val_metrics, epoch)
 
-        if val_metrics['val/acc_top1'] > best_epoch_metrics['val/acc_top1']:
+        lr_scheduler.step()
+
+        if val_metrics['val/acc_top1'] > best_epoch_metrics.get('val/acc_top1', 0):  # pylint: disable=line-too-long
             filename = os.path.join(logdir, 'checkpoint_best_model.t7')
             print(f'New best model! Saving checkpoint to {filename}')
             state = {
@@ -333,9 +336,9 @@ def run_epoch(model: torch.nn.Module,
               loader: data.DataLoader,
               device: torch.device,
               top: Sequence[int] = (1, 3),
+              criterion: Optional[torch.nn.Module] = None,
               finetune: bool = False,
-              optimizer: Optional[torch.optim.Optimizer] = None,
-              criterion: Optional[torch.nn.Module] = None
+              optimizer: Optional[torch.optim.Optimizer] = None
               ) -> Dict[str, float]:
     """Runs for 1 epoch.
 
