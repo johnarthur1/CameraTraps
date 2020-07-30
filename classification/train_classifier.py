@@ -54,7 +54,7 @@ class SimpleDataset(data.Dataset):
         """Creates a SimpleDataset."""
         self.img_paths = img_paths
         self.labels = labels
-        self.img_base_dir = img_paths
+        self.img_base_dir = img_base_dir
         self.transform = transform
         self.target_transform = target_transform
 
@@ -157,7 +157,7 @@ def create_dataloaders(classification_dataset_csv_path: str,
         is_train = (split == 'train')
         split_df = df[df['dataset_location'].isin(locs)]
         dataset = SimpleDataset(
-            img_paths=split_df['paths'].tolist(),
+            img_paths=split_df['path'].tolist(),
             labels=split_df['label_index'].tolist(),
             img_base_dir=cropped_images_dir,
             transform=train_transform if is_train else test_transform)

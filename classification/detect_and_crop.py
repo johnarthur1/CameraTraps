@@ -239,11 +239,13 @@ def filter_detected_images(
     detection_cache: Dict[str, Dict[str, Dict]] = {}
 
     images_to_detect = []
-    for img_path in potential_images_to_detect:
+    pbar = tqdm(potential_images_to_detect)
+    for img_path in pbar:
         # img_path: <dataset-name>/<img-filename>
         ds, img_file = img_path.split('/', maxsplit=1)
 
         if ds not in detection_cache:
+            pbar.set_description(f'Loading dataset {ds} into detection cache')
             detection_cache[ds] = load_detection_cache(
                 detector_output_cache_dir, ds)
 
@@ -698,14 +700,18 @@ def save_crop(img: Image.Image, bbox_norm: Sequence[float], save: str) -> None:
             normalized coordinates
         save: str, path to save cropped image
     """
-    os.makedirs(os.path.abspath(os.path.dirname(save)), exist_ok=True)
     img_width, img_height = img.size
-    img.crop(box=[
-        bbox_norm[0] * img_width,                    # left
-        bbox_norm[1] * img_height,                   # upper
-        (bbox_norm[0] + bbox_norm[2]) * img_width,   # right
-        (bbox_norm[1] + bbox_norm[3]) * img_height,  # lower
-    ]).save(save)
+    cropped_img = img.crop(box=[
+        int(bbox_norm[0] * img_width),                    # left
+        int(bbox_norm[1] * img_height),                   # upper
+        int((bbox_norm[0] + bbox_norm[2]) * img_width),   # right
+        int((bbox_norm[1] + bbox_norm[3]) * img_height),  # lower
+    ])
+    if cropped_img.size[0] == 0 or cropped_img.size[1] == 0:
+        print(f'Skipping size-0 crop {cropped_img.size} at {save}')
+        return
+    os.makedirs(os.path.abspath(os.path.dirname(save)), exist_ok=True)
+    cropped_img.save(save)
 
 
 def _parse_args() -> argparse.Namespace:
