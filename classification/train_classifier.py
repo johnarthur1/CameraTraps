@@ -48,11 +48,13 @@ class SimpleDataset(data.Dataset):
     def __init__(self,
                  img_paths: Sequence[str],
                  labels: Sequence[Any],
+                 img_base_dir: str = '',
                  transform: Optional[Callable[[PIL.Image.Image], Any]] = None,
                  target_transform: Optional[Callable[[Any], Any]] = None):
         """Creates a SimpleDataset."""
         self.img_paths = img_paths
         self.labels = labels
+        self.img_base_dir = img_paths
         self.transform = transform
         self.target_transform = target_transform
 
@@ -66,7 +68,8 @@ class SimpleDataset(data.Dataset):
 
         Returns: tuple, (sample, target)
         """
-        img = pil_loader(self.img_paths[index])
+        img_path = os.path.join(self.img_base_dir, self.img_paths[index])
+        img = pil_loader(img_path)
         if self.transform is not None:
             img = self.transform(img)
         target = self.labels[index]
@@ -112,10 +115,7 @@ def create_dataloaders(classification_dataset_csv_path: str,
 
     # read in dataset CSV and create merged (dataset, location) col
     df = pd.read_csv(classification_dataset_csv_path, index_col=False)
-    df['dataset_location'] = df[['dataset', 'location']].agg(tuple, axis=1)
-
-    # prepend cropped_images_dir to path
-    df['path'] = df['path'].map(lambda s: os.path.join(cropped_images_dir, s))
+    df['dataset_location'] = list(zip(df['dataset'], df['location']))
 
     # create mappings from labels to int
     if multilabel:
@@ -132,7 +132,7 @@ def create_dataloaders(classification_dataset_csv_path: str,
     # map label to label_index
     if multilabel:
         df['label_index'] = df['label'].map(
-            lambda labellist: [label_to_idx[label] for label in labellist])
+            lambda labellist: tuple(sorted(label_to_idx[y] for y in labellist)))
     else:
         df['label_index'] = df['label'].map(label_to_idx.__getitem__)
 
@@ -159,6 +159,7 @@ def create_dataloaders(classification_dataset_csv_path: str,
         dataset = SimpleDataset(
             img_paths=split_df['paths'].tolist(),
             labels=split_df['label_index'].tolist(),
+            img_base_dir=cropped_images_dir,
             transform=train_transform if is_train else test_transform)
         dataloaders[split] = data.DataLoader(
             dataset, batch_size=batch_size, shuffle=is_train,
@@ -174,9 +175,9 @@ def prefix_all_keys(d: Mapping[str, Any], prefix: str) -> Dict[str, Any]:
 
 def log_metrics(writer: tensorboard.SummaryWriter, metrics: Dict[str, float],
                 epoch: int, prefix: str = '') -> None:
-    """Logs metrics to TensorBoard. Prefix should not include '/'."""
+    """Logs metrics to TensorBoard."""
     for metric, value in metrics.items():
-        writer.add_scalar(f'{prefix}/{metric}', value, epoch)
+        writer.add_scalar(f'{prefix}{metric}', value, epoch)
 
 
 def main(classification_dataset_csv_path: str,
@@ -271,26 +272,28 @@ def main(classification_dataset_csv_path: str,
         train_metrics = run_epoch(
             model, loader=dataloaders['train'], device=device,
             finetune=finetune, optimizer=optimizer, criterion=criterion)
-        log_metrics(writer, train_metrics, epoch, prefix='train')
+        train_metrics = prefix_all_keys(train_metrics, prefix='train/')
+        log_metrics(writer, train_metrics, epoch)
 
         print('- val:')
         val_metrics = run_epoch(
             model, loader=dataloaders['val'], device=device,
-            finetune=finetune, criterion=criterion)
-        log_metrics(writer, val_metrics, epoch, prefix='val')
+            criterion=criterion)
+        val_metrics = prefix_all_keys(val_metrics, prefix='val/')
+        log_metrics(writer, val_metrics, epoch)
 
-        if val_metrics['acc_top1'] > best_epoch_metrics['val_acc_top1']:
+        if val_metrics['val/acc_top1'] > best_epoch_metrics['val/acc_top1']:
             filename = os.path.join(logdir, 'checkpoint_best_model.t7')
             print(f'New best model! Saving checkpoint to {filename}')
             state = {
                 'epoch': epoch,
                 'model': getattr(model, 'module', model).state_dict(),
-                'val_acc': val_metrics['acc_top1'],
+                'val/acc': val_metrics['val/acc_top1'],
                 'optimizer': optimizer.state_dict()
             }
             torch.save(state, filename)
-            best_epoch_metrics.update(prefix_all_keys(val_metrics, 'val_'))
-            best_epoch_metrics.update(prefix_all_keys(train_metrics, 'train_'))
+            best_epoch_metrics.update(train_metrics)
+            best_epoch_metrics.update(val_metrics)
 
     hparams_dict = {
         'model_name': model_name,
