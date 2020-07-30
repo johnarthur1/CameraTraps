@@ -91,6 +91,7 @@ def create_dataloaders(classification_dataset_csv_path: str,
         classification_dataset_csv_path: str, path to CSV file with columns
             ['dataset', 'location', 'label'], where label is a comma-delimited
             list of labels
+        splits_json_path: str, path to JSON file
 
     Returns:
         datasets: dict, maps split to DataLoader
@@ -197,7 +198,7 @@ def main(classification_dataset_csv_path: str,
     torch.cuda.manual_seed_all(seed)
 
     # create logdir and save params
-    params = locals()
+    params = dict(locals())  # make a copy
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')  # '20200722_110816'
     logdir = os.path.join('run', timestamp)
     os.makedirs(logdir, exist_ok=True)

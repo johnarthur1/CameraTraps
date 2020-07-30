@@ -28,7 +28,10 @@ that the dataset name does not contain '/'.
 
 TODO: describe more
 
-TODO: check that (dataset, location) tuple identifies a unique location
+We assume that the tuple (dataset, location) identifies a unique location. In
+other words, we assume that no two datasets have overlapping locations. This
+probably isn't 100% true, but it's probably the best we can do in terms of
+avoiding overlapping locations between the train/val/test splits.
 """
 import argparse
 import json
