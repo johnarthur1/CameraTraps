@@ -27,6 +27,8 @@ that the dataset name does not contain '/'.
 }
 
 TODO: describe more
+
+TODO: check that (dataset, location) tuple identifies a unique location
 """
 import argparse
 import json
@@ -205,7 +207,6 @@ def create_splits(df: pd.DataFrame) -> Dict[str, List[Tuple[str, str]]]:
         where each loc is a tuple (dataset, location)
     """
     # merge dataset and location into a tuple (dataset, location)
-    # TODO: check that (dataset, location) tuple identifies a unique location
     df['dataset_location'] = df[['dataset', 'location']].agg(tuple, axis=1)
 
     loc_to_label_sizes = df.groupby(['dataset_location', 'label']).size()
