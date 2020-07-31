@@ -25,20 +25,18 @@ that the dataset name does not contain '/'.
     ...
 }
 
-    For an image with ground truth bounding boxes, each bounding box is cropped
-and saved to a file with the same name as the original image, except the
-ending is changed from ".jpg" (for example) to "_cropXX.jpg", where "XX" ranges
-from "00" to "99". We assume that no image contains over 100 bounding boxes and
-that the ground truth bounding boxes are provided in a deterministic order. We
-also assume that ground truth bounding boxes are exhaustive--i.e., there are no
-other objects of interest, so we don't need to run MegaDetector on the image.
-    For each image without any ground truth bounding boxes, we run MegaDetector
-on the image. MegaDetector returns bounding boxes in deterministic order,
-so we label the bounding boxes in order from 00 up to 99. Based on the given
-confidence threshold, we may skip saving certain bounding box crops, but we
-still increment the bounding box number for skipped boxes. We change the
-filename ending from ".jpg" (for example) to "_mdvY.Y_cropXX.jpg" where "Y.Y"
-indicates the MegaDetector version.
+We assume that no image contains over 100 bounding boxes, and we always save
+crops as RGB .jpg files for consistency. For each image, each bounding box is
+cropped and saved to a file with the same name as the original image, except we
+add a suffix "_cropXX" for ground truth bounding boxes and "_mdvY.Y_cropXX" for
+detected bounding boxes. "XX" ranges from "00" to "99" and "Y.Y" indicates the
+MegaDetector version. If an image has ground truth bounding boxes, we assume
+that they are exhaustive--i.e., there are no other objects of interest, so we
+don't need to run MegaDetector on the image. If an image does not have ground
+truth bounding boxes, we run MegaDetector on the image and label the detected
+boxes in order from 00 up to 99. Based on the given confidence threshold, we may
+skip saving certain bounding box crops, but we still increment the bounding box
+number for skipped boxes.
 
 Example cropped image path (with ground truth bbox)
     "caltech/cct_images/59f79901-23d2-11e8-a6a3-ec086b02610b_crop00.jpg"
@@ -151,7 +149,9 @@ def main(json_images_path: str,
     assert detector in ['local', 'batchapi', 'skip']
     if save_full_images:
         assert images_dir is not None
-        assert os.path.exists(images_dir)
+        if not os.path.exists(images_dir):
+            os.makedirs(images_dir, exist_ok=True)
+            print(f'Created images_dir at {images_dir}')
 
     with open(json_images_path, 'r') as f:
         js = json.load(f)
@@ -703,12 +703,13 @@ def load_and_crop(images_dir: Optional[str], img_path: str,
             images_dir must be given and must exist if save_full_image=True
         square_crops: bool, whether to crop bounding boxes as squares
     """
+    img = None
     if images_dir is not None:
         full_img_path = os.path.join(images_dir, img_path)
         if os.path.exists(full_img_path):
             with Image.open(full_img_path) as img:
                 img.load()
-    else:
+    if img is None:
         # download image from Blob Storage
         blob_url = sas_blob_utils.build_azure_storage_uri(
             account=dataset_info['storage_account'],
@@ -717,8 +718,7 @@ def load_and_crop(images_dir: Optional[str], img_path: str,
         sas_token = dataset_info['container_sas_key']
 
         if save_full_image:
-            assert images_dir is not None
-            full_img_path = os.path.join(images_dir, img_path)
+            os.makedirs(os.path.dirname(full_img_path), exist_ok=True)
             download_blob_from_url(
                 blob_url, full_img_path, credential=sas_token)
             with Image.open(full_img_path) as img:
@@ -731,7 +731,7 @@ def load_and_crop(images_dir: Optional[str], img_path: str,
                     img.load()
 
     if img.mode != 'RGB':
-        img = img.convert(mode='RGB')
+        img = img.convert(mode='RGB')  # always save as RGB for consistency
 
     # crop the image
     for crop_path, bbox in bboxes_tocrop.items():
@@ -778,7 +778,7 @@ def save_crop(img: Image.Image, bbox_norm: Sequence[float], square_crop: bool,
         # pad to square using 0s
         crop = ImageOps.pad(crop, size=(box_size, box_size), color=0)
 
-    os.makedirs(os.path.abspath(os.path.dirname(save)), exist_ok=True)
+    os.makedirs(os.path.dirname(save), exist_ok=True)
     crop.save(save)
 
 
