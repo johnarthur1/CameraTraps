@@ -286,7 +286,7 @@ def main(classification_dataset_csv_path: str,
         lr_scheduler.step()
 
         if val_metrics['val/acc_top1'] > best_epoch_metrics.get('val/acc_top1', 0):  # pylint: disable=line-too-long
-            filename = os.path.join(logdir, 'checkpoint_best_model.t7')
+            filename = os.path.join(logdir, f'checkpoint_{epoch}.t7')
             print(f'New best model! Saving checkpoint to {filename}')
             state = {
                 'epoch': epoch,
