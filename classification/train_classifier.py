@@ -11,8 +11,8 @@ Example usage:
         run_idfg/classification_ds.csv \
         run_idfg/splits.json \
         /ssd/crops \
-        -m "efficientnet-b0" --pretrained --finetune \
-        --epochs 50 --batch-size 256 --num-workers 8 --seed 123
+        -m "efficientnet-b0" --pretrained --finetune --label-weighted \
+        --epochs 50 --batch-size 512 --num-workers 12 --seed 123
 """
 import argparse
 from datetime import datetime
@@ -30,6 +30,10 @@ from torchvision.datasets.folder import pil_loader
 import tqdm
 
 from classification import efficientnet
+
+
+_NORMALIZE_TRANSFORM = transforms.Normalize(
+    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], inplace=True)
 
 
 class AverageMeter:
@@ -56,25 +60,29 @@ class SimpleDataset(data.Dataset):
     def __init__(self,
                  img_paths: Sequence[str],
                  labels: Sequence[Any],
+                 sample_weights: Optional[Sequence[float]] = None,
                  img_base_dir: str = '',
                  transform: Optional[Callable[[PIL.Image.Image], Any]] = None,
                  target_transform: Optional[Callable[[Any], Any]] = None):
         """Creates a SimpleDataset."""
         self.img_paths = img_paths
         self.labels = labels
+        self.sample_weights = sample_weights
         self.img_base_dir = img_base_dir
         self.transform = transform
         self.target_transform = target_transform
 
-        assert len(img_paths) == len(labels)
         self.len = len(img_paths)
+        assert len(labels) == self.len
+        if sample_weights is not None:
+            assert len(sample_weights) == self.len
 
-    def __getitem__(self, index) -> Tuple[torch.Tensor, Any]:
+    def __getitem__(self, index) -> Tuple[Any, ...]:
         """
         Args:
             index: int
 
-        Returns: tuple, (sample, target)
+        Returns: tuple, (sample, target) or (sample, target, sample_weight)
         """
         img_path = os.path.join(self.img_base_dir, self.img_paths[index])
         img = pil_loader(img_path)
@@ -83,6 +91,8 @@ class SimpleDataset(data.Dataset):
         target = self.labels[index]
         if self.target_transform is not None:
             target = self.target_transform(target)
+        if self.sample_weights is not None:
+            return img, target, self.sample_weights[index]
         return img, target
 
     def __len__(self) -> int:
@@ -94,8 +104,10 @@ def create_dataloaders(classification_dataset_csv_path: str,
                        cropped_images_dir: str,
                        img_size: int,
                        multilabel: bool,
+                       label_weighted: bool,
                        batch_size: int,
-                       num_workers: int
+                       num_workers: int,
+                       augment_train: bool
                        ) -> Tuple[Dict[str, data.DataLoader], Dict[int, str]]:
     """
     Args:
@@ -103,24 +115,12 @@ def create_dataloaders(classification_dataset_csv_path: str,
             ['dataset', 'location', 'label'], where label is a comma-delimited
             list of labels
         splits_json_path: str, path to JSON file
+        augment_train: bool, whether to shuffle/augment the training set
 
     Returns:
         datasets: dict, maps split to DataLoader
         idx_to_label: dict, maps label index to label name
     """
-    with open(splits_json_path, 'r') as f:
-        split_to_locs = json.load(f)
-    split_to_locs = {
-        split: [tuple(loc) for loc in locs]
-        for split, locs in split_to_locs.items()
-    }
-
-    # assert that there are no overlaps in locs
-    split_to_locs_set = {s: set(locs) for s, locs in split_to_locs.items()}
-    assert split_to_locs_set['train'].isdisjoint(split_to_locs_set['val'])
-    assert split_to_locs_set['train'].isdisjoint(split_to_locs_set['test'])
-    assert split_to_locs_set['val'].isdisjoint(split_to_locs_set['test'])
-
     # read in dataset CSV and create merged (dataset, location) col
     df = pd.read_csv(classification_dataset_csv_path, index_col=False)
     df['dataset_location'] = list(zip(df['dataset'], df['location']))
@@ -128,11 +128,11 @@ def create_dataloaders(classification_dataset_csv_path: str,
     # create mappings from labels to int
     if multilabel:
         df['label'] = df['label'].map(lambda x: x.split(','))
-        all_labels = {label for labellist in df['label'] for label in labellist}
+        all_labels = set(df['label'].explode())
         # look into sklearn.preprocessing.MultiLabelBinarizer
     else:
         assert not any(df['label'].str.contains(','))
-        all_labels = set(df['label'].unique())
+        all_labels = set(df['label'])
 
     idx_to_label = dict(enumerate(sorted(all_labels)))
     label_to_idx = {label: idx for idx, label in idx_to_label.items()}
@@ -144,29 +144,54 @@ def create_dataloaders(classification_dataset_csv_path: str,
     else:
         df['label_index'] = df['label'].map(label_to_idx.__getitem__)
 
+    # load the splits and assert that there are no overlaps in locs
+    with open(splits_json_path, 'r') as f:
+        split_to_locs = json.load(f)
+    split_to_locs = {
+        split: set(tuple(loc) for loc in locs)
+        for split, locs in split_to_locs.items()
+    }
+    assert split_to_locs['train'].isdisjoint(split_to_locs['val'])
+    assert split_to_locs['train'].isdisjoint(split_to_locs['test'])
+    assert split_to_locs['val'].isdisjoint(split_to_locs['test'])
+
     # define the transforms
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], inplace=True)
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(img_size),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        normalize
+        _NORMALIZE_TRANSFORM
     ])
     test_transform = transforms.Compose([
         transforms.Resize(img_size, interpolation=PIL.Image.BICUBIC),
         transforms.CenterCrop(img_size),
         transforms.ToTensor(),
-        normalize
+        _NORMALIZE_TRANSFORM
     ])
+
+    if label_weighted:
+        # TODO: handle multilabel case
+        train_df = df[df['dataset_location'].isin(split_to_locs['train'])]
+        label_weights = (1 / train_df['label_index'].value_counts()).to_dict()
 
     dataloaders = {}
     for split, locs in split_to_locs.items():
-        is_train = (split == 'train')
+        is_train = (split == 'train') and augment_train
         split_df = df[df['dataset_location'].isin(locs)]
+
+        sample_weights = None
+        if label_weighted:
+            # TODO: handle multilabel case
+            # sample weights must sum to the # of examples in this split
+            sample_weights = split_df['label_index'].map(
+                label_weights.__getitem__)
+            sample_weights *= len(split_df) / sample_weights.sum()
+            sample_weights = sample_weights.tolist()
+
         dataset = SimpleDataset(
             img_paths=split_df['path'].tolist(),
             labels=split_df['label_index'].tolist(),
+            sample_weights=sample_weights,
             img_base_dir=cropped_images_dir,
             transform=train_transform if is_train else test_transform)
         dataloaders[split] = data.DataLoader(
@@ -195,6 +220,7 @@ def main(classification_dataset_csv_path: str,
          model_name: str,
          pretrained: bool,
          finetune: bool,
+         label_weighted: bool,
          epochs: int,
          batch_size: int,
          num_workers: int,
@@ -223,9 +249,12 @@ def main(classification_dataset_csv_path: str,
         cropped_images_dir=cropped_images_dir,
         img_size=efficientnet.EfficientNet.get_image_size(model_name),
         multilabel=multilabel,
+        label_weighted=label_weighted,
         batch_size=batch_size,
-        num_workers=num_workers)
+        num_workers=num_workers,
+        augment_train=True)
     with open(os.path.join(logdir, 'label_index.json'), 'w') as f:
+        # Note: JSON always saves keys as strings!
         json.dump(idx_to_label, f)
 
     # create model
@@ -234,7 +263,8 @@ def main(classification_dataset_csv_path: str,
         model = efficientnet.EfficientNet.from_pretrained(
             model_name, num_classes=num_classes)
     else:
-        model = efficientnet.EfficientNet.from_name(model_name)
+        model = efficientnet.EfficientNet.from_name(
+            model_name, num_classes=num_classes)
     if finetune:
         # set all parameters to not require gradients except final FC layer
         for param in model.parameters():
@@ -256,9 +286,9 @@ def main(classification_dataset_csv_path: str,
     # define loss function (criterion) and optimizer
     criterion: torch.nn.Module
     if multilabel:
-        criterion = torch.nn.BCEWithLogitsLoss().to(device)
+        criterion = torch.nn.BCEWithLogitsLoss(reduction='none').to(device)
     else:
-        criterion = torch.nn.CrossEntropyLoss().to(device)
+        criterion = torch.nn.CrossEntropyLoss(reduction='none').to(device)
 
     # using EfficientNet training defaults
     # - batch norm momentum: 0.99
@@ -266,7 +296,7 @@ def main(classification_dataset_csv_path: str,
     # - epochs: 350
     # - learning rate: 0.256, decays by 0.97 every 2.4 epochs
     # - weight decay: 1e-5
-    lr = 0.016 * batch_size / 256  # based on TensorFlow models
+    lr = 0.016 * batch_size / 256  # based on TensorFlow models repo
     if pretrained:
         lr *= 0.97 ** (175 / 2.4)  # set lr to the halfway point
     optimizer = torch.optim.RMSprop(
@@ -280,21 +310,23 @@ def main(classification_dataset_csv_path: str,
 
         print('- train:')
         train_metrics = run_epoch(
-            model, loader=loaders['train'], device=device, criterion=criterion,
-            finetune=finetune, optimizer=optimizer)
+            model, loader=loaders['train'], weighted=label_weighted,
+            device=device, criterion=criterion, finetune=finetune,
+            optimizer=optimizer)
         train_metrics = prefix_all_keys(train_metrics, prefix='train/')
         log_metrics(writer, train_metrics, epoch)
 
         print('- val:')
         val_metrics = run_epoch(
-            model, loader=loaders['val'], device=device, criterion=criterion)
+            model, loader=loaders['val'], weighted=label_weighted,
+            device=device, criterion=criterion)
         val_metrics = prefix_all_keys(val_metrics, prefix='val/')
         log_metrics(writer, val_metrics, epoch)
 
         lr_scheduler.step()  # decrease the learning rate
 
         if val_metrics['val/acc_top1'] > best_epoch_metrics.get('val/acc_top1', 0):  # pylint: disable=line-too-long
-            filename = os.path.join(logdir, f'checkpoint_{epoch}.t7')
+            filename = os.path.join(logdir, f'ckpt_{epoch}.pt')
             print(f'New best model! Saving checkpoint to {filename}')
             state = {
                 'epoch': epoch,
@@ -320,34 +352,41 @@ def main(classification_dataset_csv_path: str,
 
 
 def correct(outputs: torch.Tensor, targets: torch.Tensor,
-            top: Sequence[int] = (1,)) -> List[int]:
+            weights: Optional[torch.Tensor] = None,
+            top: Sequence[int] = (1,)) -> List[float]:
     """
     Args:
         outputs: torch.Tensor, shape [N, num_classes],
             either logits (pre-softmax) or probabilities
         targets: torch.Tensor, shape [N]
+        weights: optional torch.Tensor, shape [N]
         top: tuple of int, list of values of k for calculating top-K accuracy
 
-    Returns: list of int, same length as top, # of correct predictions @ each k
+    Returns: list of float, same length as top, (weighted) # of correct
+        predictions @ each k
     """
     with torch.no_grad():
         # preds and targets both have shape [N, k]
         _, preds = outputs.topk(k=max(top), dim=1, largest=True, sorted=True)
         targets = targets.view(-1, 1).expand_as(preds)
 
-        # corrects has shape [k]
-        corrects = preds.eq(targets).cpu().int().cumsum(dim=1).sum(dim=0)
+        corrects = preds.eq(targets).cumsum(dim=1)  # shape [N, k]
+        if weights is None:
+            corrects = corrects.sum(dim=0)  # shape [k]
+        else:
+            corrects = weights.matmul(corrects.to(weights.dtype))  # shape [k]
         tops = list(map(lambda k: corrects[k - 1].item(), top))
     return tops
 
 
 def run_epoch(model: torch.nn.Module,
               loader: data.DataLoader,
+              weighted: bool,
               device: torch.device,
               top: Sequence[int] = (1, 3),
               criterion: Optional[torch.nn.Module] = None,
               finetune: bool = False,
-              optimizer: Optional[torch.optim.Optimizer] = None
+              optimizer: Optional[torch.optim.Optimizer] = None,
               ) -> Dict[str, float]:
     """Runs for 1 epoch.
 
@@ -360,10 +399,11 @@ def run_epoch(model: torch.nn.Module,
         finetune: bool, if true sets model's dropout and BN layers to eval mode
         optimizer: optional optimizer
 
-    Returns: dict, metrics from epoch, contains keys:
-        'loss': float, mean per-example loss over entire epoch,
-            only included if criterion is not None
-        'acc_top{k}': float, accuracy@k over the entire epoch
+    Returns:
+        metrics: dict, metrics from epoch, contains keys:
+            'loss': float, mean per-example loss over entire epoch,
+                only included if criterion is not None
+            'acc_top{k}': float, accuracy@k over the entire epoch
     """
     if optimizer is not None:
         assert criterion is not None
@@ -373,11 +413,18 @@ def run_epoch(model: torch.nn.Module,
 
     if criterion is not None:
         losses = AverageMeter()
-    accuracies = [AverageMeter() for _ in top]
+    accuracies = [AverageMeter() for _ in top]  # acc@k
 
     tqdm_loader = tqdm.tqdm(loader)
     with torch.set_grad_enabled(optimizer is not None):
-        for inputs, targets in tqdm_loader:
+        for batch in tqdm_loader:
+            if weighted:
+                inputs, targets, weights = batch
+                weights = weights.to(device, non_blocking=True)
+            else:
+                inputs, targets = batch
+                weights = None
+
             batch_size = targets.size(0)
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
@@ -385,7 +432,11 @@ def run_epoch(model: torch.nn.Module,
 
             desc = []
             if criterion is not None:
-                loss = criterion(outputs, targets)
+                if weighted:
+                    loss = criterion(outputs, targets) * weights
+                else:
+                    loss = criterion(outputs, targets)
+                loss = loss.mean()
                 losses.update(loss.item(), n=batch_size)
                 desc.append(f'Loss {losses.val:.4f} ({losses.avg:.4f})')
             if optimizer is not None:
@@ -393,7 +444,7 @@ def run_epoch(model: torch.nn.Module,
                 loss.backward()
                 optimizer.step()
 
-            top_correct = correct(outputs, targets, top=top)
+            top_correct = correct(outputs, targets, weights=weights, top=top)
             for acc, count, k in zip(accuracies, top_correct, top):
                 acc.update(count * (100. / batch_size), n=batch_size)
                 desc.append(f'Acc@{k} {acc.val:.3f} ({acc.avg:.3f})')
@@ -406,13 +457,6 @@ def run_epoch(model: torch.nn.Module,
         metrics[f'acc_top{k}'] = acc.avg
     return metrics
 
-
-# defaults from EfficientNet paper
-# - optimizer: RMSProp, decay 0.9 and momentum 0.9
-# - batch norm momentum: 0.99
-# - epochs: 350
-# - learning rate: 0.256, decays by 0.97 every 2.4 epochs
-# - weight decay: 1e-5
 
 def _parse_args() -> argparse.Namespace:
     """Parses arguments."""
@@ -441,6 +485,9 @@ def _parse_args() -> argparse.Namespace:
         '--finetune', action='store_true',
         help='only fine tune the final fully-connected layer')
     parser.add_argument(
+        '--label-weighted', action='store_true',
+        help='weight training samples to balance labels')
+    parser.add_argument(
         '--epochs', type=int, default=0,
         help='number of epochs for training (default: 0, eval only)')
     parser.add_argument(
@@ -464,6 +511,7 @@ if __name__ == '__main__':
          model_name=args.model_name,
          pretrained=args.pretrained,
          finetune=args.finetune,
+         label_weighted=args.label_weighted,
          epochs=args.epochs,
          batch_size=args.batch_size,
          num_workers=args.num_workers,
