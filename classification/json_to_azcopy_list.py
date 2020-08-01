@@ -39,9 +39,9 @@ for img_path, img_info in pbar:
             url = sas_blob_utils.build_azure_storage_uri(
                 account, container,
                 sas_token=dataset_info['container_sas_key'][1:])
-        pbar.write(url)
+        pbar.write(f'"{url}"')
 
-    output_files[ds].write(img_file)
+    output_files[ds].write(img_file + '\n')
 
 for f in output_files.values():
     f.close()

@@ -1,10 +1,18 @@
-"""Train an EfficientNet classifier.
+r"""Train an EfficientNet classifier.
 
 Currently implementation of multi-label multi-class classification is
 non-functional.
 
 During training, start tensorboard from within the classification/ directory:
     tensorboard --logdir run
+
+Example usage:
+    python train_classifier.py \
+        run_idfg/classification_ds.csv \
+        run_idfg/splits.json \
+        /ssd/crops \
+        -m "efficientnet-b0" --pretrained --finetune \
+        --epochs 50 --batch-size 256 --num-workers 8 --seed 123
 """
 import argparse
 from datetime import datetime
@@ -84,7 +92,7 @@ class SimpleDataset(data.Dataset):
 def create_dataloaders(classification_dataset_csv_path: str,
                        splits_json_path: str,
                        cropped_images_dir: str,
-                       image_size: int,
+                       img_size: int,
                        multilabel: bool,
                        batch_size: int,
                        num_workers: int
@@ -140,14 +148,14 @@ def create_dataloaders(classification_dataset_csv_path: str,
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], inplace=True)
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(image_size),
+        transforms.RandomResizedCrop(img_size),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize
     ])
     test_transform = transforms.Compose([
-        transforms.Resize(image_size, interpolation=PIL.Image.BICUBIC),
-        transforms.CenterCrop(image_size),
+        transforms.Resize(img_size, interpolation=PIL.Image.BICUBIC),
+        transforms.CenterCrop(img_size),
         transforms.ToTensor(),
         normalize
     ])
@@ -213,7 +221,7 @@ def main(classification_dataset_csv_path: str,
         classification_dataset_csv_path=classification_dataset_csv_path,
         splits_json_path=splits_json_path,
         cropped_images_dir=cropped_images_dir,
-        image_size=efficientnet.EfficientNet.get_image_size(model_name),
+        img_size=efficientnet.EfficientNet.get_image_size(model_name),
         multilabel=multilabel,
         batch_size=batch_size,
         num_workers=num_workers)
@@ -283,7 +291,7 @@ def main(classification_dataset_csv_path: str,
         val_metrics = prefix_all_keys(val_metrics, prefix='val/')
         log_metrics(writer, val_metrics, epoch)
 
-        lr_scheduler.step()
+        lr_scheduler.step()  # decrease the learning rate
 
         if val_metrics['val/acc_top1'] > best_epoch_metrics.get('val/acc_top1', 0):  # pylint: disable=line-too-long
             filename = os.path.join(logdir, f'checkpoint_{epoch}.t7')
@@ -297,6 +305,7 @@ def main(classification_dataset_csv_path: str,
             torch.save(state, filename)
             best_epoch_metrics.update(train_metrics)
             best_epoch_metrics.update(val_metrics)
+            best_epoch_metrics['epoch'] = epoch
 
     hparams_dict = {
         'model_name': model_name,
@@ -305,7 +314,7 @@ def main(classification_dataset_csv_path: str,
         'batch_size': batch_size,
         'epochs': epochs
     }
-    metric_dict = prefix_all_keys(best_epoch_metrics, 'hparam/')
+    metric_dict = prefix_all_keys(best_epoch_metrics, prefix='hparam/')
     writer.add_hparams(hparam_dict=hparams_dict, metric_dict=metric_dict)
     writer.close()
 
@@ -343,13 +352,22 @@ def run_epoch(model: torch.nn.Module,
     """Runs for 1 epoch.
 
     Args:
-        criterion: loss function, calculates the mean loss over a batch
+        model: torch.nn.Module
+        loader: torch.utils.data.DataLoader
+        device: torch.device
+        top: tuple of int, list of values of k for calculating top-K accuracy
+        criterion: optional loss function, calculates the mean loss over a batch
+        finetune: bool, if true sets model's dropout and BN layers to eval mode
+        optimizer: optional optimizer
 
     Returns: dict, metrics from epoch, contains keys:
         'loss': float, mean per-example loss over entire epoch,
             only included if criterion is not None
         'acc_top{k}': float, accuracy@k over the entire epoch
     """
+    if optimizer is not None:
+        assert criterion is not None
+
     # if evaluating or finetuning, set dropout and BN layers to eval mode
     model.train(optimizer is not None and not finetune)
 
