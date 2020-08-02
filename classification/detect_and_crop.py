@@ -91,8 +91,8 @@ import json
 import os
 import pprint
 import time
-from typing import (
-    Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple)
+from typing import (Any, BinaryIO, Dict, Iterable, List, Mapping, Optional,
+                    Sequence, Tuple, Union)
 
 from azure.storage.blob import download_blob_from_url
 from PIL import Image, ImageOps
@@ -213,7 +213,7 @@ def main(json_images_path: str,
         threads=threads)
     print('Images with missing detections:')
     pprint.pprint(images_missing_detections)
-    print('Images that failed to download:')
+    print('Images that failed to download or crop properly:')
     pprint.pprint(images_failed_download)
 
 
@@ -612,7 +612,7 @@ def download_and_crop(
         images_missing_detections: list of str, image files without ground truth
             or cached detected bounding boxes
         images_failed_download: list of str, images with bounding boxes that
-            failed to download
+            failed to download or crop properly
     """
     # we need the datasets table for getting SAS keys
     datasets_table = megadb_utils.MegadbUtils().get_datasets_table()
@@ -623,10 +623,11 @@ def download_and_crop(
     # True for ground truth, False for MegaDetector
     # always save as JPG for consistency
     crop_path_template = {
-        True: os.path.join(cropped_images_dir,
-                           '{img_path_root}_crop{n:>02d}.jpg'),
-        False: os.path.join(cropped_images_dir,
-                            '{img_path_root}_mdv{v}_crop{n:>02d}.jpg')
+        True: os.path.join(
+            cropped_images_dir, '{img_path_root}_crop{n:>02d}.jpg'),
+        False: os.path.join(
+            cropped_images_dir,
+            '{img_path_root}_' + f'mdv{detector_version}' + '_crop{n:>02d}.jpg')
     }
 
     pool = futures.ThreadPoolExecutor(max_workers=threads)
@@ -638,36 +639,22 @@ def download_and_crop(
         assert ds == info_dict['dataset']
 
         # get bounding boxes
-        if 'bbox' in info_dict:  # ground-truth bounding boxes
+        is_ground_truth = ('bbox' in info_dict)
+        if is_ground_truth:  # ground-truth bounding boxes
             bbox_dicts = info_dict['bbox']
-            is_ground_truth = True
         else:  # get bounding boxes from detector cache
             if img_file in detection_cache[ds]:
                 bbox_dicts = detection_cache[ds][img_file]['detections']
+                assert all('conf' in bbox_dict for bbox_dict in bbox_dicts)
             else:
                 images_missing_detections.append(img_path)
                 continue
-            is_ground_truth = False
-
-        # check if crops are already downloaded, and ignore bboxes below the
-        # confidence threshold
-        bboxes_tocrop: Dict[str, Dict[str, Any]] = {}  # crop_path => bbox
-        for i, bbox_dict in enumerate(bbox_dicts):
-            # ground-truth bboxes do not have a "confidence" value
-            if not is_ground_truth and bbox_dict['conf'] < confidence_threshold:
-                continue
-            img_path_root = os.path.splitext(img_path)[0]
-            crop_path = crop_path_template[is_ground_truth].format(
-                img_path_root=img_path_root, v=detector_version, n=i)
-            if not os.path.exists(crop_path):
-                bboxes_tocrop[crop_path] = bbox_dict['bbox']
-        if len(bboxes_tocrop) == 0:
-            continue
 
         # get the image, either from disk or from Blob Storage
         future = pool.submit(
-            load_and_crop, images_dir, img_path, datasets_table[ds],
-            bboxes_tocrop, save_full_images, square_crops)
+            load_and_crop, img_path, datasets_table[ds], bbox_dicts,
+            confidence_threshold, crop_path_template[is_ground_truth],
+            save_full_images, square_crops, images_dir)
         future_to_img_path[future] = img_path
 
     n_futures = len(future_to_img_path)
@@ -678,7 +665,8 @@ def download_and_crop(
         try:
             future.result()
         except Exception as e:  # pylint: disable=broad-except
-            tqdm.write(f'{img_path} - generated an exception: {e}')
+            exception_type = type(e).__name__
+            tqdm.write(f'{img_path} - generated {exception_type}: {e}')
             images_failed_download.append(img_path)
         else:
             tqdm.write(f'{img_path} - successfully loaded and cropped')
@@ -687,28 +675,58 @@ def download_and_crop(
     return images_missing_detections, images_failed_download
 
 
-def load_and_crop(images_dir: Optional[str], img_path: str,
+def load_local_image(img_path: Union[str, BinaryIO]) -> Optional[Image.Image]:
+    """Attempts to load an image from a local path."""
+    try:
+        with Image.open(img_path) as img:
+            img.load()
+        return img
+    except OSError as e:  # PIL.UnidentifiedImageError is a subclass of OSError
+        exception_type = type(e).__name__
+        tqdm.write(f'Unable to load {img_path}. {exception_type}: {e}.')
+    return None
+
+
+def load_and_crop(img_path: str,
                   dataset_info: Mapping[str, Any],
-                  bboxes_tocrop: Mapping[str, Sequence[float]],
-                  save_full_image: bool, square_crops: bool) -> None:
-    """Loads an image from disk or Azure Blob Storage, then crops it.
+                  bbox_dicts: Iterable[Mapping[str, Any]],
+                  confidence_threshold: float,
+                  crop_path_template: str,
+                  save_full_image: bool,
+                  square_crops: bool,
+                  images_dir: Optional[str]) -> None:
+    """Given an image and a list of bounding boxes, checks if the crops already
+    exist. If not, loads the image locally or Azure Blob Storage, then crops it.
 
     Args:
         images_dir: optional str, path to local directory of images
         img_path: str, image path with format `<dataset-name>/<blob-name>`
         dataset_info: dict, info about dataset from MegaDB
-        bboxes_tocrop: dict, maps crop file name to [xmin, ymin, width, height]
-            all in normalized coordinates
-        save_full_image: bool, whether to save downloaded image to images_dir,
-            images_dir must be given and must exist if save_full_image=True
+        bbox_dicts: list of dicts, each dict contains info on a bounding box
+        confidence_threshold: float, only crop bounding boxes above this value
+        save_full_images: bool, whether to save downloaded images to images_dir,
+            images_dir must be given and must exist if save_full_images=True
         square_crops: bool, whether to crop bounding boxes as squares
+        images_dir: optional str, path to folder where full images are saved
     """
+    # crop_path => normalized bbox coordinates [xmin, ymin, width, height]
+    bboxes_tocrop: Dict[str, List[float]] = {}
+    for i, bbox_dict in enumerate(bbox_dicts):
+        # only ground-truth bboxes do not have a "confidence" value
+        if 'conf' in bbox_dict and bbox_dict['conf'] < confidence_threshold:
+            continue
+        img_path_root = os.path.splitext(img_path)[0]
+        crop_path = crop_path_template.format(img_path_root=img_path_root, n=i)
+        if not os.path.exists(crop_path) or load_local_image(crop_path) is None:
+            bboxes_tocrop[crop_path] = bbox_dict['bbox']
+    if len(bboxes_tocrop) == 0:
+        return
+
     img = None
     if images_dir is not None:
         full_img_path = os.path.join(images_dir, img_path)
         if os.path.exists(full_img_path):
-            with Image.open(full_img_path) as img:
-                img.load()
+            img = load_local_image(full_img_path)
     if img is None:
         # download image from Blob Storage
         blob_url = sas_blob_utils.build_azure_storage_uri(
@@ -720,16 +738,16 @@ def load_and_crop(images_dir: Optional[str], img_path: str,
         if save_full_image:
             os.makedirs(os.path.dirname(full_img_path), exist_ok=True)
             download_blob_from_url(
-                blob_url, full_img_path, credential=sas_token)
-            with Image.open(full_img_path) as img:
-                img.load()
+                blob_url, full_img_path, credential=sas_token, overwrite=True)
+            img = load_local_image(full_img_path)
         else:
             with io.BytesIO() as stream:
-                download_blob_from_url(blob_url, stream, credential=sas_token)
+                download_blob_from_url(
+                    blob_url, stream, credential=sas_token, overwrite=True)
                 stream.seek(0)
-                with Image.open(stream) as img:
-                    img.load()
+                img = load_local_image(stream)
 
+    assert img is not None
     if img.mode != 'RGB':
         img = img.convert(mode='RGB')  # always save as RGB for consistency
 
@@ -768,7 +786,7 @@ def save_crop(img: Image.Image, bbox_norm: Sequence[float], square_crop: bool,
         box_h = min(img_h, box_size)
 
     if box_w == 0 or box_h == 0:
-        print(f'Skipping size-0 crop (w={box_w}, h={box_h}) at {save}')
+        tqdm.write(f'Skipping size-0 crop (w={box_w}, h={box_h}) at {save}')
         return
 
     # Image.crop() takes box=[left, upper, right, lower]
