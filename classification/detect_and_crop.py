@@ -115,6 +115,7 @@ def main(json_images_path: str,
          detector: str,
          save_full_images: bool,
          square_crops: bool,
+         check_crops_valid: bool,
          confidence_threshold: float = 0,
          images_dir: Optional[str] = None,
          threads: int = 1,
@@ -136,6 +137,8 @@ def main(json_images_path: str,
         save_full_images: bool, whether to save downloaded images to images_dir,
             images_dir must be given if save_full_images=True
         square_crops: bool, whether to crop bounding boxes as squares
+        check_crops_valid: bool, whether to load each crop to ensure the file is
+            valid (i.e., not truncated)
         confidence_threshold: float, only crop bounding boxes above this value
         skip_detection: bool, whether to skip running the detector
         images_dir: optional str, path to local directory where images are saved
@@ -209,11 +212,16 @@ def main(json_images_path: str,
         confidence_threshold=confidence_threshold,
         save_full_images=save_full_images,
         square_crops=square_crops,
+        check_crops_valid=check_crops_valid,
         images_dir=images_dir,
         threads=threads)
-    print('Images with missing detections:')
+
+    num_missing_detections = len(images_missing_detections)
+    print(f'{num_missing_detections} images with missing detections:')
     pprint.pprint(images_missing_detections)
-    print('Images that failed to download or crop properly:')
+
+    num_failed = len(images_failed_download)
+    print(f'{num_failed} images failed to download or crop properly:')
     pprint.pprint(images_failed_download)
 
 
@@ -583,6 +591,7 @@ def download_and_crop(
         confidence_threshold: float,
         save_full_images: bool,
         square_crops: bool,
+        check_crops_valid: bool,
         images_dir: Optional[str] = None,
         threads: int = 1
         ) -> Tuple[List[str], List[str]]:
@@ -605,6 +614,8 @@ def download_and_crop(
         save_full_images: bool, whether to save downloaded images to images_dir,
             images_dir must be given and must exist if save_full_images=True
         square_crops: bool, whether to crop bounding boxes as squares
+        check_crops_valid: bool, whether to load each crop to ensure the file is
+            valid (i.e., not truncated)
         images_dir: optional str, path to folder where full images are saved
         threads: int, number of threads to use for downloading images
 
@@ -654,7 +665,7 @@ def download_and_crop(
         future = pool.submit(
             load_and_crop, img_path, datasets_table[ds], bbox_dicts,
             confidence_threshold, crop_path_template[is_ground_truth],
-            save_full_images, square_crops, images_dir)
+            save_full_images, square_crops, check_crops_valid, images_dir)
         future_to_img_path[future] = img_path
 
     n_futures = len(future_to_img_path)
@@ -694,6 +705,7 @@ def load_and_crop(img_path: str,
                   crop_path_template: str,
                   save_full_image: bool,
                   square_crops: bool,
+                  check_crops_valid: bool,
                   images_dir: Optional[str]) -> None:
     """Given an image and a list of bounding boxes, checks if the crops already
     exist. If not, loads the image locally or Azure Blob Storage, then crops it.
@@ -707,6 +719,8 @@ def load_and_crop(img_path: str,
         save_full_images: bool, whether to save downloaded images to images_dir,
             images_dir must be given and must exist if save_full_images=True
         square_crops: bool, whether to crop bounding boxes as squares
+        check_crops_valid: bool, whether to load each crop to ensure the file is
+            valid (i.e., not truncated)
         images_dir: optional str, path to folder where full images are saved
     """
     # crop_path => normalized bbox coordinates [xmin, ymin, width, height]
@@ -717,7 +731,8 @@ def load_and_crop(img_path: str,
             continue
         img_path_root = os.path.splitext(img_path)[0]
         crop_path = crop_path_template.format(img_path_root=img_path_root, n=i)
-        if not os.path.exists(crop_path) or load_local_image(crop_path) is None:
+        if not os.path.exists(crop_path) or (
+                check_crops_valid and load_local_image(crop_path) is None):
             bboxes_tocrop[crop_path] = bbox_dict['bbox']
     if len(bboxes_tocrop) == 0:
         return
@@ -843,6 +858,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--square-crops', action='store_true',
         help='crop bounding boxes as squares')
+    parser.add_argument(
+        '--check-crops-valid', action='store_true',
+        help='load each crop to ensure the file is valid (i.e., not truncated)')
     return parser.parse_args()
 
 
@@ -855,6 +873,7 @@ if __name__ == '__main__':
          detector=args.detector,
          save_full_images=args.save_full_images,
          square_crops=args.square_crops,
+         check_crops_valid=args.check_crops_valid,
          confidence_threshold=args.confidence_threshold,
          images_dir=args.images_dir,
          threads=args.threads,
