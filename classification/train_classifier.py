@@ -30,15 +30,19 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-import PIL
+import PIL.Image
 import torch
 from torch.utils import data, tensorboard
+import torchvision
 from torchvision import transforms
-from torchvision.datasets.folder import pil_loader
+from torchvision.datasets.folder import default_loader
 import tqdm
 
 from classification import efficientnet
 
+
+# use accimage backend, which is faster than Pillow and Pillow-SIMD
+torchvision.set_image_backend('accimage')
 
 _NORMALIZE_TRANSFORM = transforms.Normalize(
     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], inplace=True)
@@ -93,7 +97,7 @@ class SimpleDataset(data.Dataset):
         Returns: tuple, (sample, target) or (sample, target, sample_weight)
         """
         img_path = os.path.join(self.img_base_dir, self.img_paths[index])
-        img = pil_loader(img_path)
+        img = default_loader(img_path)
         if self.transform is not None:
             img = self.transform(img)
         target = self.labels[index]

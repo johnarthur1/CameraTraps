@@ -3,6 +3,7 @@ name: cameratraps-classifier
 channels:
 - pytorch
 - defaults
+- conda-forge
 
 dependencies:
 - python>=3.6
@@ -32,6 +33,9 @@ dependencies:
 - tqdm
 - xlrd          # for pandas Excel support, needed by taxonomy_mapping/process_species_by_dataset
 - pip
+
+# from conda-forge
+- accimage      # faster Pillow replacement for torchvision
 
 # Some Azure packages or versions are only available from PyPI
 # These may require GCC to be installed
