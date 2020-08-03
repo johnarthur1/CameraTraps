@@ -6,13 +6,21 @@ non-functional.
 During training, start tensorboard from within the classification/ directory:
     tensorboard --logdir run
 
+TODO:
+- plot learning rate in tensorboard
+- run evaluate_mode.py at the end of training
+- stop if val_loss and val_acc have not been increasing for 10 epochs
+- investigate class weights
+- verify that finetuning is really only changing the final-layer weights
+
 Example usage:
     python train_classifier.py \
         run_idfg/classification_ds.csv \
         run_idfg/splits.json \
-        /ssd/crops \
+        /ssd/crops_sq \
         -m "efficientnet-b0" --pretrained --finetune --label-weighted \
-        --epochs 50 --batch-size 512 --num-workers 12 --seed 123
+        --epochs 50 --batch-size 512 --lr 1e-4 \
+        --num-workers 12 --seed 123
 """
 import argparse
 from datetime import datetime
@@ -223,6 +231,7 @@ def main(classification_dataset_csv_path: str,
          label_weighted: bool,
          epochs: int,
          batch_size: int,
+         lr: float,
          num_workers: int,
          seed: Optional[int] = None):
     """Main function."""
@@ -238,7 +247,7 @@ def main(classification_dataset_csv_path: str,
     logdir = os.path.join('run', timestamp)
     os.makedirs(logdir, exist_ok=True)
     with open(os.path.join(logdir, 'params.json'), 'w') as f:
-        json.dump(params, f)
+        json.dump(params, f, indent=1)
 
     writer = tensorboard.SummaryWriter(logdir)
 
@@ -255,7 +264,7 @@ def main(classification_dataset_csv_path: str,
         augment_train=True)
     with open(os.path.join(logdir, 'label_index.json'), 'w') as f:
         # Note: JSON always saves keys as strings!
-        json.dump(idx_to_label, f)
+        json.dump(idx_to_label, f, indent=1)
 
     # create model
     num_classes = len(idx_to_label)
@@ -296,9 +305,6 @@ def main(classification_dataset_csv_path: str,
     # - epochs: 350
     # - learning rate: 0.256, decays by 0.97 every 2.4 epochs
     # - weight decay: 1e-5
-    lr = 0.016 * batch_size / 256  # based on TensorFlow models repo
-    if pretrained:
-        lr *= 0.97 ** (175 / 2.4)  # set lr to the halfway point
     optimizer = torch.optim.RMSprop(
         model.parameters(), lr, alpha=0.9, momentum=0.9, weight_decay=1e-5)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(
@@ -307,6 +313,7 @@ def main(classification_dataset_csv_path: str,
     best_epoch_metrics: Dict[str, float] = {}
     for epoch in range(epochs):
         print(f'Epoch: {epoch}')
+        writer.add_scalar('lr', lr_scheduler.get_last_lr()[0], epoch)
 
         print('- train:')
         train_metrics = run_epoch(
@@ -494,6 +501,9 @@ def _parse_args() -> argparse.Namespace:
         '--batch-size', type=int, default=256,
         help='batch size for both training and eval')
     parser.add_argument(
+        '--lr', type=float, default=None,
+        help='initial learning rate, defaults to (0.016 * batch_size / 256)')
+    parser.add_argument(
         '--num-workers', type=int, default=8,
         help='number of workers for data loading')
     parser.add_argument(
@@ -504,6 +514,8 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == '__main__':
     args = _parse_args()
+    if args.lr is None:
+        args.lr = 0.016 * args.batch_size / 256  # based on TF models repo
     main(classification_dataset_csv_path=args.classification_dataset_csv,
          splits_json_path=args.splits_json,
          cropped_images_dir=args.cropped_images_dir,
@@ -514,5 +526,6 @@ if __name__ == '__main__':
          label_weighted=args.label_weighted,
          epochs=args.epochs,
          batch_size=args.batch_size,
+         lr=args.lr,
          num_workers=args.num_workers,
          seed=args.seed)
