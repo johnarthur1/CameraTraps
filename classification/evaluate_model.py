@@ -17,9 +17,12 @@ Example usage:
 import argparse
 import json
 import os
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import sklearn.metrics
 import torch
 from torch.utils import data
 import tqdm
@@ -79,19 +82,25 @@ def main(logdir: str, ckpt_name: str):
     else:
         criterion = torch.nn.CrossEntropyLoss(reduction='none').to(device)
 
-    split_to_metrics = {}
-    split_to_label_stats = {}
+    split_metrics = {}
+    split_label_stats = {}
+    split_cm = {}
     for split, loader in loaders.items():
         print(split)
-        split_to_metrics[split], split_to_label_stats[split] = test_epoch(
+        metrics, label_stats, cm = test_epoch(
             model, loader=loader, weighted=True, device=device,
             label_ids=idx_to_label.keys(), criterion=criterion)
+        split_metrics[split] = metrics
+        split_label_stats[split] = label_stats
+        split_cm[split] = cm
 
-    metrics_sr = pd.concat(split_to_metrics, names=['split', 'metric'])
+        plot_confusion_matrix(cm, logdir, split, idx_to_label)
+
+    metrics_sr = pd.concat(split_metrics, names=['split', 'metric'])
     metrics_sr.to_csv(os.path.join(logdir, 'overall_metrics.csv'))
 
     label_stats_df = pd.concat(
-        split_to_label_stats, names=['split', 'label_id']).reset_index()
+        split_label_stats, names=['split', 'label_id']).reset_index()
     label_stats_df['label'] = label_stats_df['label_id'].map(
         idx_to_label.__getitem__)
     label_stats_df.to_csv(os.path.join(logdir, 'label_stats.csv'), index=False)
@@ -103,6 +112,22 @@ def main(logdir: str, ckpt_name: str):
 def per_label_acc(df: pd.DataFrame):
     """df contains columns ['tp', 'fn']"""
     return df['tp'] / (df['tp'] + df['fn'])
+
+
+def plot_confusion_matrix(cm: np.ndarray, logdir: str, split: str,
+                          idx_to_label: Mapping[int, str]) -> None:
+    """Plot confusion matrix and save fig."""
+    max_idx = max(idx_to_label.keys())
+    display_labels = [idx_to_label[idx] for idx in range(max_idx + 1)]
+    cm_display = sklearn.metrics.ConfusionMatrixDisplay(
+        cm, display_labels=display_labels)
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+    cm_display.plot(ax=ax)
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(logdir, f'confusion_matrix_{split}.png'),
+        transparent=True, bbox_inches='tight', pad_inches=0)
+    np.save(os.path.join(logdir, f'confusion_matrix_{split}.npy'), cm)
 
 
 def test_epoch(model: torch.nn.Module,
@@ -118,6 +143,7 @@ def test_epoch(model: torch.nn.Module,
     Args:
         model: torch.nn.Module
         loader: torch.utils.data.DataLoader
+        weighted: bool, whether to calculate weighted accuracy statistics
         device: torch.device
         top: tuple of int, list of values of k for calculating top-K accuracy
         criterion: optional loss function, calculates the mean loss over a batch
@@ -136,10 +162,15 @@ def test_epoch(model: torch.nn.Module,
 
     if criterion is not None:
         losses = train_classifier.AverageMeter()
-    accuracies = [train_classifier.AverageMeter() for _ in top]  # acc@k
+    accs = [train_classifier.AverageMeter() for _ in top]  # acc@k
+    if weighted:
+        accs_weighted = [train_classifier.AverageMeter() for _ in top]  # acc@k
 
     label_stats = pd.DataFrame(
         data=0, columns=['tp', 'fp', 'fn'], index=sorted(label_ids))
+
+    all_labels = []
+    all_outputs = []
 
     tqdm_loader = tqdm.tqdm(loader)
     with torch.no_grad():
@@ -155,6 +186,9 @@ def test_epoch(model: torch.nn.Module,
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             outputs = model(inputs)
+
+            all_labels.append(targets.detach().cpu().numpy())
+            all_outputs.append(outputs.detach().cpu().numpy())
 
             desc = []
             if criterion is not None:
@@ -176,19 +210,36 @@ def test_epoch(model: torch.nn.Module,
                     label_stats.loc[ypred, 'fp'] += 1
 
             top_correct = train_classifier.correct(
-                outputs, targets, weights=weights, top=top)
-            for acc, count, k in zip(accuracies, top_correct, top):
+                outputs, targets, weights=None, top=top)
+            for acc, count, k in zip(accs, top_correct, top):
                 acc.update(count * (100. / batch_size), n=batch_size)
                 desc.append(f'Acc@{k} {acc.val:.3f} ({acc.avg:.3f})')
+
+            if weighted:
+                top_correct = train_classifier.correct(
+                    outputs, targets, weights=weights, top=top)
+                for acc, count, k in zip(accs_weighted, top_correct, top):
+                    acc.update(count * (100. / batch_size), n=batch_size)
+                    desc.append(f'Acc_w@{k} {acc.val:.3f} ({acc.avg:.3f})')
+
             tqdm_loader.set_description(' '.join(desc))
+
+    all_labels = np.concatenate(all_labels)
+    all_outputs = np.concatenate(all_outputs)
+
+    # a confusion matrix C is such that C[i,j] is the # of observations known to
+    # be in group i and predicted to be in group j.
+    cm = sklearn.metrics.confusion_matrix(y_true=all_labels, y_pred=all_outputs)
 
     metrics = {}
     if criterion is not None:
         metrics['loss'] = losses.avg
-    for k, acc in zip(top, accuracies):
+    for k, acc in zip(top, accs):
         metrics[f'acc_top{k}'] = acc.avg
-    return pd.Series(metrics), label_stats
-
+    if weighted:
+        for k, acc in zip(top, accs_weighted):
+            metrics[f'acc_weighted_top{k}'] = acc.avg
+    return pd.Series(metrics), label_stats, cm
 
 
 def _parse_args() -> argparse.Namespace:
