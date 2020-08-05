@@ -31,6 +31,12 @@ from api.batch_processing.postprocessing.postprocess_batch_results import (
     PostProcessingOptions,
     process_batch_results)
 
+
+#%% Constants
+
+max_task_name_length = 92
+
+
 #%% Constants I set per taskgroup
 
 ### Required
@@ -206,6 +212,11 @@ for i, taskgroup_json_paths in enumerate(folder_chunks):
         task_json_filename_root = os.path.splitext(task_json_filename)[0]
         task_name = f'{base_task_name}_{task_json_filename_root}'.replace(
             '.', '_')
+        if task_name > max_task_name_length:
+            long_task_name = task_name
+            task_name = task_name[:max_task_name_length]
+            print(f'Warning: task name {long_task_name} too long, shortened to '
+                  f'{task_name}.')
         assert task_name not in task_names
         task_names.add(task_name)
         task = prepare_api_submission.Task(
@@ -610,8 +621,8 @@ data = None
 from api.batch_processing.postprocessing.subset_json_detector_output import subset_json_detector_output
 from api.batch_processing.postprocessing.subset_json_detector_output import SubsetJsonDetectorOutputOptions
 
-input_filename = inputFilename = list(folder_name_to_combined_output_file.values())[0]
-output_base = os.path.join(filename_base, 'json_subsets')
+input_filename = list(folder_name_to_combined_output_file.values())[0]
+output_base = os.path.join(filename_base,'json_subsets')
 
 folders = os.listdir(image_base)
 
@@ -635,6 +646,22 @@ for i_folder, folder_name in enumerate(folders):
     options.query = folder_name + '\\'
 
     subset_data = subset_json_detector_output(input_filename, output_filename, options, data)
+
+
+#%% String replacement
+    
+data = None
+
+from api.batch_processing.postprocessing.subset_json_detector_output import subset_json_detector_output
+from api.batch_processing.postprocessing.subset_json_detector_output import SubsetJsonDetectorOutputOptions
+
+input_filename = list(folder_name_to_combined_output_file.values())[0]
+output_filename = input_filename.replace('.json','_replaced.json')
+
+options = SubsetJsonDetectorOutputOptions()
+options.query = folder_name + '/'
+options.replacement = ''
+subset_json_detector_output(input_filename,output_filename,options)
 
 
 #%% Folder splitting
