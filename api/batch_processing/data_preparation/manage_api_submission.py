@@ -28,8 +28,7 @@ import sas_blob_utils  # from ai4eutils
 from api.batch_processing.data_preparation import prepare_api_submission
 from api.batch_processing.postprocessing import combine_api_outputs
 from api.batch_processing.postprocessing.postprocess_batch_results import (
-    PostProcessingOptions,
-    process_batch_results)
+    PostProcessingOptions, process_batch_results)
 
 
 #%% Constants
@@ -255,9 +254,7 @@ pprint.pprint(request_strings)
 clipboard.copy('\n\n'.join(request_strings))
 
 
-#%% Run the tasks (still in progress, doesn't actually work yet)
-
-# Not working yet, something is wrong with my post call
+#%% Run the tasks (don't run this cell unless you are absolutely sure!)
 
 for taskgroup in taskgroups:
     for task in taskgroup:
@@ -618,8 +615,8 @@ for fn in html_output_files:
 
 data = None
 
-from api.batch_processing.postprocessing.subset_json_detector_output import subset_json_detector_output
-from api.batch_processing.postprocessing.subset_json_detector_output import SubsetJsonDetectorOutputOptions
+from api.batch_processing.postprocessing.subset_json_detector_output import (
+    subset_json_detector_output, SubsetJsonDetectorOutputOptions)
 
 input_filename = list(folder_name_to_combined_output_file.values())[0]
 output_base = os.path.join(filename_base,'json_subsets')
@@ -652,8 +649,8 @@ for i_folder, folder_name in enumerate(folders):
     
 data = None
 
-from api.batch_processing.postprocessing.subset_json_detector_output import subset_json_detector_output
-from api.batch_processing.postprocessing.subset_json_detector_output import SubsetJsonDetectorOutputOptions
+from api.batch_processing.postprocessing.subset_json_detector_output import (
+    subset_json_detector_output, SubsetJsonDetectorOutputOptions)
 
 input_filename = list(folder_name_to_combined_output_file.values())[0]
 output_filename = input_filename.replace('.json','_replaced.json')
@@ -666,8 +663,8 @@ subset_json_detector_output(input_filename,output_filename,options)
 
 #%% Folder splitting
 
-from api.batch_processing.postprocessing.separate_detections_into_folders import separate_detections_into_folders
-from api.batch_processing.postprocessing.separate_detections_into_folders import SeparateDetectionsIntoFoldersOptions
+from api.batch_processing.postprocessing.separate_detections_into_folders import (
+    separate_detections_into_folders, SeparateDetectionsIntoFoldersOptions)
 
 default_threshold = 0.8
 options = SeparateDetectionsIntoFoldersOptions()
