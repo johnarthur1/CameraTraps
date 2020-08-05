@@ -100,7 +100,7 @@ import requests
 from tqdm import tqdm
 
 from api.batch_processing.data_preparation.prepare_api_submission import (
-    Task, TaskStatus, divide_list_into_tasks)
+    BatchAPIResponseError, Task, TaskStatus, divide_list_into_tasks)
 from api.batch_processing.postprocessing.combine_api_outputs import (
     combine_api_output_dictionaries)
 from data_management.megadb import megadb_utils
@@ -119,7 +119,8 @@ def main(json_images_path: str,
          confidence_threshold: float = 0,
          images_dir: Optional[str] = None,
          threads: int = 1,
-         resume_file_path: Optional[str] = None) -> None:
+         resume_file_path: Optional[str] = None,
+         api_output_log_dir: Optional[str] = None) -> None:
     """
     Args:
         json_images_path: str, path to output of json_validator.py
@@ -146,6 +147,9 @@ def main(json_images_path: str,
         resume_file_path: optional str, path to save JSON file with list of info
             dicts on running tasks, or to resume from running tasks, only used
             if detector=='batchapi'
+        api_output_log_dir: optional str, path to directory to save task status
+            response for completed tasks. Only used if detector=='batchapi'.
+            Task responses are saved as output_{task_id}.json.
     """
     # error checking
     assert 0 <= confidence_threshold <= 1
@@ -196,13 +200,15 @@ def main(json_images_path: str,
                     caller=caller,
                     batch_detection_api_url=batch_detection_api_url,
                     resume_file_path=resume_file_path)
-            wait_for_tasks(tasks_by_dataset, detector_output_cache_dir)
+            wait_for_tasks(tasks_by_dataset, detector_output_cache_dir,
+                           api_output_log_dir=api_output_log_dir)
 
-        # verify there are no more images to detect, and refresh detection cache
+        # refresh detection cache
+        print('Refreshing detection cache...')
         images_to_detect, detection_cache = filter_detected_images(
             potential_images_to_detect=[k for k in js if 'bbox' not in js[k]],
             detector_output_cache_dir=detector_output_cache_dir)
-        assert len(images_to_detect) == 0
+        print(f'{len(images_to_detect)} images not in detection cache')
 
     images_missing_detections, images_failed_download = download_and_crop(
         json_images=js,
@@ -488,6 +494,7 @@ def resume_tasks(resume_file_path: str, batch_detection_api_url: str
 
 def wait_for_tasks(tasks_by_dataset: Mapping[str, Iterable[Task]],
                    detector_output_cache_dir: str,
+                   api_output_log_dir: Optional[str] = None,
                    poll_interval: int = 120) -> None:
     """Waits for the Batch Detection API tasks to finish running.
 
@@ -499,6 +506,9 @@ def wait_for_tasks(tasks_by_dataset: Mapping[str, Iterable[Task]],
         detector_output_cache_dir: str, path to local directory where detector
             outputs are cached, 1 JSON file per dataset, directory must
             already exist
+        api_output_log_dir: optional str, path to directory to save task status
+            response for completed tasks. Only used if detector=='batchapi'.
+            Task responses are saved as output_{task_id}.json.
         poll_interval: int, # of seconds between pinging the task status API
     """
     remaining_tasks: List[Tuple[str, Task]] = [
@@ -509,7 +519,14 @@ def wait_for_tasks(tasks_by_dataset: Mapping[str, Iterable[Task]],
     while True:
         new_remaining_tasks = []
         for dataset, task in remaining_tasks:
-            task.check_status()
+            try:
+                task.check_status()
+            except (BatchAPIResponseError, requests.HTTPError) as e:
+                exception_type = type(e).__name__
+                tqdm.write(f'Error in checking status of task {task.id}: '
+                           f'({exception_type}) {e}')
+                tqdm.write(f'Skipping task {task.id}.')
+                continue
 
             # task still running => continue
             if task.status == TaskStatus.RUNNING:
@@ -517,33 +534,40 @@ def wait_for_tasks(tasks_by_dataset: Mapping[str, Iterable[Task]],
                 continue
 
             progbar.update(1)
-            progbar.write(f'Task {task.id} stopped with status {task.status}')
+            tqdm.write(f'Task {task.id} stopped with status {task.status}')
 
             if task.status in [TaskStatus.PROBLEM, TaskStatus.FAILED]:
-                progbar.write('API response:')
-                progbar.write(task.response)
+                tqdm.write('API response:')
+                tqdm.write(task.response)
                 continue
 
-            # task finished successfully
+            # task finished successfully, save response to disk
             assert task.status == TaskStatus.COMPLETED
+            if api_output_log_dir is not None:
+                filename = f'output_{task.id}.json'
+                with open(os.path.join(api_output_log_dir, filename), 'w') as f:
+                    json.dump(task.response, f, indent=1)
             message = task.response['Status']['message']
             num_failed_shards = message['num_failed_shards']
             if num_failed_shards != 0:
-                progbar.write(f'Task {task.id} completed with '
-                              f'{num_failed_shards} failed shards.')
+                tqdm.write(f'Task {task.id} completed with {num_failed_shards} '
+                           'failed shards.')
 
             detections_url = message['output_file_urls']['detections']
-            assert task.id in detections_url
+            if task.id not in detections_url:
+                tqdm.write('Invalid detections URL in response. Skipping task.')
+                continue
+
             detections = requests.get(detections_url).json()
             msg = cache_detections(
                 detections=detections, dataset=dataset,
                 detector_output_cache_dir=detector_output_cache_dir)
-            progbar.write(msg)
+            tqdm.write(msg)
 
         remaining_tasks = new_remaining_tasks
         if len(remaining_tasks) == 0:
             break
-        progbar.write(f'Sleeping for {poll_interval} seconds...')
+        tqdm.write(f'Sleeping for {poll_interval} seconds...')
         time.sleep(poll_interval)
 
     progbar.close()
@@ -837,6 +861,15 @@ def _parse_args() -> argparse.Namespace:
              'skip running the detector entirely (and only use ground truth '
              'and cached bounding boxes.')
     parser.add_argument(
+        '--save-full-images', action='store_true',
+        help='if downloading an image, save the full image to --images-dir')
+    parser.add_argument(
+        '--square-crops', action='store_true',
+        help='crop bounding boxes as squares')
+    parser.add_argument(
+        '--check-crops-valid', action='store_true',
+        help='load each crop to ensure the file is valid (i.e., not truncated)')
+    parser.add_argument(
         '-t', '--confidence-threshold', type=float, default=0.0,
         help='confidence threshold above which to crop bounding boxes')
     parser.add_argument(
@@ -853,14 +886,10 @@ def _parse_args() -> argparse.Namespace:
              '["dataset", "task_id", "task_name", "local_images_list_path", '
              '"remote_images_list_url"]')
     parser.add_argument(
-        '--save-full-images', action='store_true',
-        help='if downloading an image, save the full image to --images-dir')
-    parser.add_argument(
-        '--square-crops', action='store_true',
-        help='crop bounding boxes as squares')
-    parser.add_argument(
-        '--check-crops-valid', action='store_true',
-        help='load each crop to ensure the file is valid (i.e., not truncated)')
+        '--api-output-log-dir', default=None,
+        help='path to directory to save task status response for completed '
+             'tasks. Only used if --detector=batchapi. Task responses are '
+             'saved as output_{task_id}.json.')
     return parser.parse_args()
 
 
@@ -877,4 +906,5 @@ if __name__ == '__main__':
          confidence_threshold=args.confidence_threshold,
          images_dir=args.images_dir,
          threads=args.threads,
-         resume_file_path=args.resume_file)
+         resume_file_path=args.resume_file,
+         api_output_log_dir=args.api_output_log_dir)
