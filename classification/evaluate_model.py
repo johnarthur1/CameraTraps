@@ -1,39 +1,35 @@
-r"""Train an EfficientNet classifier.
+r"""Evaluate a species classifier.
 
 Currently implementation of multi-label multi-class classification is
 non-functional.
 
-During training, start tensorboard from within the classification/ directory:
-    tensorboard --logdir run
-
 Example usage:
-    python train_classifier.py \
-        run_idfg/classification_ds.csv \
-        run_idfg/splits.json \
-        /ssd/crops \
-        -m "efficientnet-b0" --pretrained --finetune \
-        --epochs 50 --batch-size 256 --num-workers 8 --seed 123
+    python evaluate_model.py run_idfg/logs/20200803_145515 ckpt_6.pt
 """
 import argparse
 import json
 import os
-from typing import Iterable, Mapping, Optional, Sequence, Tuple
+from pprint import pprint
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import sklearn.metrics
 import torch
-from torch.utils import data
+import torchvision
 import tqdm
 
 from classification import efficientnet, train_classifier
+
+torchvision.set_image_backend('accimage')
 
 
 def main(logdir: str, ckpt_name: str):
     """Main function."""
     with open(os.path.join(logdir, 'params.json'), 'r') as f:
         params = json.load(f)
+    pprint(params)
     model_name = params['model_name']
 
     loaders, idx_to_label = train_classifier.create_dataloaders(

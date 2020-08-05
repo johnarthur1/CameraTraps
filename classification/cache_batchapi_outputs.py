@@ -25,9 +25,11 @@ def main(json_path: str,
     assert status == TaskStatus.COMPLETED
 
     # parse the task ID
+    task_id = response['TaskId']
+
     message = response['Status']['message']
     detections_url = message['output_file_urls']['detections']
-    task_id = detections_url.split('/')[-2]
+    assert detections_url.split('/')[-2] == task_id
 
     # print info about missing and failed images
     task = Task(name=task_id, task_id=task_id)
