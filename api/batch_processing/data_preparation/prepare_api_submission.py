@@ -94,9 +94,9 @@ class Task:
     api_url: str
     local_images_list_path: str
     remote_images_list_url: str  # includes SAS token if uploaded with one
-    api_request: Dict[str, Any]
+    api_request: Dict[str, Any]  # request object before JSON serialization
     id: str
-    response: Dict[str, Any]
+    response: Dict[str, Any]  # decoded response JSON
     status: TaskStatus
 
     def __init__(self, name: str, task_id: Optional[str] = None,
@@ -255,7 +255,9 @@ class Task:
 
         Returns: dict, contains fields ['Status', 'TaskId'] and possibly others
 
-        Raises: requests.HTTPError, if an HTTP error occurred
+        Raises:
+            requests.HTTPError, if an HTTP error occurred
+            BatchAPIResponseError, if response task ID does not match self.id
         """
         url = posixpath.join(self.api_url, self.task_status_endpoint, self.id)
         r = requests.get(url)
@@ -264,6 +266,10 @@ class Task:
         assert r.status_code == requests.codes.ok
 
         self.response = r.json()
+        if self.response['TaskId'] != self.id:
+            raise BatchAPIResponseError(
+                f'Response task ID {self.response["TaskId"]} does not match '
+                f'expected task ID {self.id}.')
         self.status = TaskStatus(self.response['Status']['request_status'])
         return self.response
 
