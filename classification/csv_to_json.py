@@ -10,6 +10,7 @@ There are 3 possible values for the 'type' column in the CSV:
     content syntax: <taxon_name>
 
 Example CSV input:
+    # comment lines starting with '#' are allowed
     output_label,type,content
 
     cervid,row,idfg|deer
@@ -145,7 +146,7 @@ def parse_csv_row(obj: Dict[str, Any], rowtype: str, content: str) -> None:
 
 def csv_to_jsondict(csv_path: str) -> Dict[str, Dict[str, Any]]:
     """Converts CSV to json-style dictionary"""
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, comment='#', skip_blank_lines=True)
     assert (df.columns == ['output_label', 'type', 'content']).all()
 
     js: Dict[str, Dict[str, Any]] = defaultdict(dict)
